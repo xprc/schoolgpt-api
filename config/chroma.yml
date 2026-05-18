@@ -1,0 +1,13 @@
+collection_name: agent
+persist_directory: chroma_db
+
+k: 7                    # 返回 Top-7
+score_threshold: 0.25  # 余弦相似度低于此值的片段直接过滤
+filter: null             # 可按 metadata 过滤，如 {"source": "doc1.pdf"}
+data_path: data
+
+md5_hex_store: md5.text
+allow_knowledge_file_type: ["txt", "pdf", "csv"]
+
+chunk_size: 200
+chunk_overlap: 40
