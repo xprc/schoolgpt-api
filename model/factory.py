@@ -45,8 +45,3 @@ class EmbeddingsFactory(BaseModelFactory):
 webchat_model = webChatModelFactory().generator()
 bendichat_model = bendiChatModelFactory().generator()
 embedding_model=EmbeddingsFactory().generator()
-
-
-if __name__ == '__main__':
-    t1=EmbeddingsFactory().generator()
-    print(111)

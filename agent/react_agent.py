@@ -25,9 +25,3 @@ class ReactAgent(object):
             latest_message = chunk["messages"][-1]  # 有历史记录所以取最后一条
             if latest_message.content:
                 yield latest_message.content.strip() + "\n"
-
-if __name__ == '__main__':
-    ang=ReactAgent()
-    result = ang.execute_stream("如何转专业")
-    for chunk in result:
-        print(chunk, end="", flush=True)  # 模拟流式打字机效果

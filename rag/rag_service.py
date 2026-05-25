@@ -41,8 +41,3 @@ class RagSummarylize(object):
                 "context":context,
             }
         )
-
-
-if __name__ == '__main__':
-    rag=RagSummarylize()
-    print(rag.rag_summarize("如何保研?"))

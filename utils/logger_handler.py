@@ -1,4 +1,3 @@
-# logger_utils.py
 import logging
 import os
 import re
@@ -11,9 +10,8 @@ LOG_ROOT = get_abs_path("logs")
 # 确保日志目录存在
 os.makedirs(LOG_ROOT, exist_ok=True)
 
-# 日志格式配置（包含时间、模块、行号，便于调试Agent）
 DEFAULT_LOG_FORMAT = logging.Formatter(
-    "%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s",
+    "%(asctime)s - %(levelname)s - %(name)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 
@@ -54,27 +52,27 @@ class SensitiveDataFilter(logging.Filter):
 def get_logger(
         name: str = "agent",
         console_level: int = logging.INFO,
-        file_level: int = logging.DEBUG,
+        file_level: int = logging.INFO,
         log_file: Optional[str] = None
 ) -> logging.Logger:
     """
     获取配置好的日志器（开箱即用）
     :param name: 日志器名称（建议按模块命名，如agent.tools/agent.rag/agent.llm）
-    :param console_level: 控制台日志级别（默认INFO，开发时可设为DEBUG）
-    :param file_level: 文件日志级别（默认DEBUG，记录详细信息）
+    :param console_level: 控制台日志级别
+    :param file_level: 文件日志级别
     :param log_file: 自定义日志文件名（默认按日期生成：agent_20240121.log）
     :return: 配置完成的Logger对象
     """
     # 1. 创建/获取日志器
     logger = logging.getLogger(name)
-    logger.setLevel(logging.DEBUG)  # 全局最低级别
+    logger.setLevel(min(console_level, file_level))
     logger.addFilter(SensitiveDataFilter())  # 添加脱敏过滤器
 
     # 避免重复添加Handler（多次导入时只配置一次）
     if logger.handlers:
         return logger
 
-    # 2. 配置控制台Handler（开发调试用）
+    # 2. 配置控制台Handler
     console_handler = logging.StreamHandler()
     console_handler.setLevel(console_level)
     console_handler.setFormatter(DEFAULT_LOG_FORMAT)

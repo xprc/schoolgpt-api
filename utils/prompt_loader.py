@@ -52,8 +52,3 @@ def load_rag_prompt():
     except Exception as e:
         logger.error(f"[rag_prompt_path]解析报告提示词{rag_prompt_path}失败. {str(e)}")
         raise e
-
-
-if __name__ == '__main__':
-    #print(load_system_prompt())
-    print(load_rag_prompt())

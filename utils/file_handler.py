@@ -1,71 +1,3 @@
-# import hashlib
-# import os
-#
-# from langchain_community.document_loaders import CSVLoader, PyPDFLoader, TextLoader
-#
-#
-# def get_file_md5_hex(filepath):
-#
-#     if not os.path.exists(filepath):
-#         print(f"错误：文件{filepath} 不存在")
-#         return None
-#
-#     if not os.path.isfile(filepath):
-#         print(f"错误：{filepath}不是有效文件")
-#         return None
-#
-#     md5_obj=hashlib.md5()#初始化md5对象
-#     chunk_size=4096
-#     try:
-#         with open(filepath,"rb") as f:
-#             while chunk :=f.read(chunk_size):
-#                 md5_obj.update(chunk)
-#
-#             md5_hex=md5_obj.hexdigest()
-#
-#             return md5_hex
-#     except PermissionError:
-#         print(f"错误：无权限读取文件{filepath}")
-#         return None
-#     except Exception as e:
-#         print(f"计算MD5失败{str(e)}")
-#         return None
-#
-# def listdir_with_allowed_type(path:str,allowed_types:tuple[str]):
-#     files=[]
-#     print("x2",allowed_types,type(allowed_types))
-#     if not os.path.isdir(path):
-#         print(f"错误{path}不是有效目录或不存在")
-#         return tuple(files)
-#
-#     for f in os.listdir(path):
-#         print("x1",f)
-#         if f.endswith(allowed_types):
-#             print("x2",f)
-#             files.append(os.path.join(path,f))
-#
-#     return tuple(files)
-#
-# def csv_loader(filepath,source_colum,encoding="utf-8",csv_args=None):
-#     loader=CSVLoader(
-#         filepath,
-#         source_column=source_colum,
-#         encoding=encoding,
-#         csv_args=csv_args,
-#     )
-#     return loader.load()
-#
-# def pdf_loader(filepath,passwd=None):
-#     return PyPDFLoader(filepath,passwd).load()
-#
-# def txt_loader(filepath):
-#     return TextLoader(filepath,encoding="utf_8",autodetect_encoding=True).load()
-#
-#
-#
-#
-#
-
 import hashlib
 import logging
 import re
@@ -75,8 +7,6 @@ import pdfplumber
 from langchain_core.documents import Document
 from langchain_community.document_loaders import CSVLoader, TextLoader
 
-# 配置日志（仅输出 WARNING 及以上，保持控制台清爽）
-logging.basicConfig(level=logging.WARNING, format="%(asctime)s | %(levelname)-8s | %(message)s")
 logger = logging.getLogger(__name__)
 
 

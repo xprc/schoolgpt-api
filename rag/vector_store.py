@@ -117,20 +117,3 @@ class VectorStoreService:
                 # exc_info为True会记录详细报错堆栈，False仅记录报错str
                 logger.error(f"[加载知识库] {path} 加载失败：{str(e)}", exc_info=True)
                 continue
-
-if __name__ == '__main__':
-    store = VectorStoreService()
-
-    store.load_document()
-
-    retriever = store.get_retriever()
-
-    res = retriever.invoke("转专业方法")
-    for r in res:
-        print(r.page_content)
-        print("-" * 20)
-
-
-
-
-
