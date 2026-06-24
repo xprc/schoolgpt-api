@@ -32,6 +32,14 @@ class ConversationShareRequest(BaseModel):
     share_scope: ConversationShareScope
 
 
+class ConversationRenameRequest(BaseModel):
+    title: str = Field(..., max_length=255)
+
+
+class ConversationPinRequest(BaseModel):
+    is_pinned: bool
+
+
 class ConversationMessageResponse(BaseModel):
     id: str
     role: ChatMessageRole
@@ -47,6 +55,9 @@ class ConversationResponse(BaseModel):
     share_scope: ConversationShareScope
     permission: ConversationPermission
     can_write: bool
+    is_pinned: bool
+    pinned_at: str | None = None
+    is_visible: bool
     created_at: str
     updated_at: str
     messages: list[ConversationMessageResponse]
@@ -58,5 +69,8 @@ class ConversationSummaryResponse(BaseModel):
     share_scope: ConversationShareScope
     permission: ConversationPermission
     can_write: bool
+    is_pinned: bool
+    pinned_at: str | None = None
+    is_visible: bool
     created_at: str
     updated_at: str

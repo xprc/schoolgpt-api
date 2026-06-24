@@ -1,9 +1,11 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
+from hashlib import sha256
 
 import bcrypt
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Connection
 from sqlalchemy.engine.url import make_url
 
 from api.core.settings import Settings, get_settings
@@ -14,6 +16,7 @@ CREATE TABLE IF NOT EXISTS users (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     username VARCHAR(64) NOT NULL,
     email VARCHAR(120) NOT NULL,
+    avatar_sha256 CHAR(64) NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
     display_name VARCHAR(120) NOT NULL,
     is_active TINYINT(1) NOT NULL DEFAULT 1,
@@ -22,7 +25,8 @@ CREATE TABLE IF NOT EXISTS users (
     last_login_at TIMESTAMP NULL DEFAULT NULL,
     PRIMARY KEY (id),
     UNIQUE KEY uq_users_username (username),
-    UNIQUE KEY uq_users_email (email)
+    UNIQUE KEY uq_users_email (email),
+    UNIQUE KEY uq_users_avatar_sha256 (avatar_sha256)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 """
 
@@ -32,6 +36,7 @@ class User:
     id: int
     username: str
     email: str
+    avatar_sha256: str
     display_name: str
     is_active: bool
 
@@ -47,6 +52,11 @@ def _verify_password(password: str, password_hash: str) -> bool:
         return False
 
 
+def _email_to_avatar_sha256(email: str) -> str:
+    normalized_email = email.strip().lower()
+    return sha256(normalized_email.encode("utf-8")).hexdigest()
+
+
 def _quote_mysql_identifier(identifier: str) -> str:
     return "`" + identifier.replace("`", "``") + "`"
 
@@ -56,6 +66,7 @@ def _row_to_user(row: Mapping[str, object]) -> User:
         id=int(row["id"]),
         username=str(row["username"]),
         email=str(row["email"]),
+        avatar_sha256=str(row["avatar_sha256"]),
         display_name=str(row["display_name"]),
         is_active=bool(row["is_active"]),
     )
@@ -99,8 +110,97 @@ class UserService:
     def _initialize_database(self) -> None:
         with self._engine.begin() as connection:
             connection.execute(text(CREATE_USERS_SQL))
+            self._ensure_avatar_sha256_column(connection)
+            self._backfill_avatar_sha256(connection)
+            self._ensure_avatar_sha256_index(connection)
 
         self._ensure_default_user()
+
+    def _mysql_column_exists(self, connection: Connection, column_name: str) -> bool:
+        if self._engine.dialect.name != "mysql":
+            return True
+
+        count = connection.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                    AND TABLE_NAME = 'users'
+                    AND COLUMN_NAME = :column_name
+                """
+            ),
+            {"column_name": column_name},
+        ).scalar_one()
+        return int(count) > 0
+
+    def _mysql_index_exists(self, connection: Connection, index_name: str) -> bool:
+        if self._engine.dialect.name != "mysql":
+            return True
+
+        count = connection.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE()
+                    AND TABLE_NAME = 'users'
+                    AND INDEX_NAME = :index_name
+                """
+            ),
+            {"index_name": index_name},
+        ).scalar_one()
+        return int(count) > 0
+
+    def _ensure_avatar_sha256_column(self, connection: Connection) -> None:
+        if self._engine.dialect.name != "mysql":
+            return
+
+        if not self._mysql_column_exists(connection, "avatar_sha256"):
+            connection.execute(
+                text(
+                    """
+                    ALTER TABLE users
+                    ADD COLUMN avatar_sha256 CHAR(64) NULL AFTER email
+                    """
+                )
+            )
+
+    def _ensure_avatar_sha256_index(self, connection: Connection) -> None:
+        if self._engine.dialect.name != "mysql":
+            return
+
+        if not self._mysql_index_exists(connection, "uq_users_avatar_sha256"):
+            connection.execute(
+                text(
+                    """
+                    ALTER TABLE users
+                    ADD UNIQUE KEY uq_users_avatar_sha256 (avatar_sha256)
+                    """
+                )
+            )
+
+    def _backfill_avatar_sha256(self, connection: Connection) -> None:
+        if self._engine.dialect.name != "mysql":
+            return
+
+        connection.execute(
+            text(
+                """
+                UPDATE users
+                SET avatar_sha256 = SHA2(LOWER(TRIM(email)), 256)
+                WHERE avatar_sha256 IS NULL OR avatar_sha256 = ''
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                ALTER TABLE users
+                MODIFY avatar_sha256 CHAR(64) NOT NULL
+                """
+            )
+        )
 
     def _ensure_default_user(self) -> None:
         with self._engine.connect() as connection:
@@ -124,18 +224,32 @@ class UserService:
         display_name: str,
     ) -> User:
         password_hash = _hash_password(password)
+        avatar_sha256 = _email_to_avatar_sha256(email)
 
         with self._engine.begin() as connection:
             cursor = connection.execute(
                 text(
                     """
-                    INSERT INTO users (username, email, password_hash, display_name)
-                    VALUES (:username, :email, :password_hash, :display_name)
+                    INSERT INTO users (
+                        username,
+                        email,
+                        avatar_sha256,
+                        password_hash,
+                        display_name
+                    )
+                    VALUES (
+                        :username,
+                        :email,
+                        :avatar_sha256,
+                        :password_hash,
+                        :display_name
+                    )
                     """
                 ),
                 {
                     "username": username,
                     "email": email,
+                    "avatar_sha256": avatar_sha256,
                     "password_hash": password_hash,
                     "display_name": display_name,
                 },
@@ -157,7 +271,14 @@ class UserService:
             row = connection.execute(
                 text(
                     """
-                    SELECT id, username, email, password_hash, display_name, is_active
+                    SELECT
+                        id,
+                        username,
+                        email,
+                        avatar_sha256,
+                        password_hash,
+                        display_name,
+                        is_active
                     FROM users
                     WHERE username = :identifier OR email = :identifier
                     """
@@ -190,7 +311,7 @@ class UserService:
             row = connection.execute(
                 text(
                     """
-                    SELECT id, username, email, display_name, is_active
+                    SELECT id, username, email, avatar_sha256, display_name, is_active
                     FROM users
                     WHERE id = :user_id
                     """

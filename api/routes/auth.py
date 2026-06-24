@@ -15,6 +15,7 @@ def _to_user_profile(user: User) -> UserProfile:
         id=user.id,
         username=user.username,
         email=user.email,
+        avatar_sha256=user.avatar_sha256,
         display_name=user.display_name,
     )
 

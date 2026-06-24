@@ -2,7 +2,9 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from api.core.security import TokenPayload, get_current_token_payload
 from api.schemas.chat import (
+    ConversationPinRequest,
     ConversationMessageResponse,
+    ConversationRenameRequest,
     ConversationResponse,
     ConversationShareRequest,
     ConversationSummaryResponse,
@@ -53,6 +55,9 @@ def _to_conversation_response(conversation: ConversationData) -> ConversationRes
         share_scope=conversation.share_scope,
         permission=conversation.permission,
         can_write=conversation.can_write,
+        is_pinned=conversation.is_pinned,
+        pinned_at=conversation.pinned_at,
+        is_visible=conversation.is_visible,
         created_at=conversation.created_at,
         updated_at=conversation.updated_at,
         messages=[_to_message_response(message) for message in conversation.messages],
@@ -66,6 +71,9 @@ def _to_summary_response(summary: ConversationSummary) -> ConversationSummaryRes
         share_scope=summary.share_scope,
         permission=summary.permission,
         can_write=summary.can_write,
+        is_pinned=summary.is_pinned,
+        pinned_at=summary.pinned_at,
+        is_visible=summary.is_visible,
         created_at=summary.created_at,
         updated_at=summary.updated_at,
     )
@@ -119,6 +127,68 @@ async def save_conversation(
         raise _not_found_exception() from exc
 
     return _to_conversation_response(conversation)
+
+
+@router.patch("/{conversation_id}/rename", response_model=ConversationResponse)
+async def rename_conversation(
+    conversation_id: str,
+    request: ConversationRenameRequest,
+    token_payload: TokenPayload = Depends(get_current_token_payload),
+    service: ConversationService = Depends(get_conversation_service),
+) -> ConversationResponse:
+    try:
+        conversation = service.rename_conversation(
+            conversation_id=conversation_id,
+            user_id=token_payload.user_id,
+            title=request.title,
+        )
+    except ConversationNotFoundError as exc:
+        raise _not_found_exception() from exc
+    except ConversationPermissionError as exc:
+        raise _permission_exception() from exc
+    except ValueError as exc:
+        raise _not_found_exception() from exc
+
+    return _to_conversation_response(conversation)
+
+
+@router.patch("/{conversation_id}/pin", response_model=ConversationResponse)
+async def update_conversation_pin(
+    conversation_id: str,
+    request: ConversationPinRequest,
+    token_payload: TokenPayload = Depends(get_current_token_payload),
+    service: ConversationService = Depends(get_conversation_service),
+) -> ConversationResponse:
+    try:
+        conversation = service.update_pin_state(
+            conversation_id=conversation_id,
+            user_id=token_payload.user_id,
+            is_pinned=request.is_pinned,
+        )
+    except ConversationNotFoundError as exc:
+        raise _not_found_exception() from exc
+    except ConversationPermissionError as exc:
+        raise _permission_exception() from exc
+    except ValueError as exc:
+        raise _not_found_exception() from exc
+
+    return _to_conversation_response(conversation)
+
+
+@router.delete("/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_conversation(
+    conversation_id: str,
+    token_payload: TokenPayload = Depends(get_current_token_payload),
+    service: ConversationService = Depends(get_conversation_service),
+) -> None:
+    try:
+        service.hide_conversation(conversation_id, token_payload.user_id)
+    except ConversationNotFoundError as exc:
+        raise _not_found_exception() from exc
+    except ConversationPermissionError as exc:
+        raise _permission_exception() from exc
+    except ValueError as exc:
+        raise _not_found_exception() from exc
 
 
 @router.patch("/{conversation_id}/share", response_model=ConversationResponse)

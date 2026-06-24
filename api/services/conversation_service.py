@@ -19,10 +19,20 @@ CREATE TABLE IF NOT EXISTS conversations (
     owner_user_id BIGINT UNSIGNED NOT NULL,
     title VARCHAR(255) NOT NULL,
     share_scope VARCHAR(16) NOT NULL DEFAULT 'private',
+    is_pinned BOOLEAN NOT NULL DEFAULT FALSE,
+    pinned_at DATETIME(6) NULL,
+    is_visible BOOLEAN NOT NULL DEFAULT TRUE,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
     PRIMARY KEY (id),
     KEY idx_conversations_owner_updated (owner_user_id, updated_at),
+    KEY idx_conversations_owner_visible_pinned (
+        owner_user_id,
+        is_visible,
+        is_pinned,
+        pinned_at,
+        updated_at
+    ),
     CONSTRAINT fk_conversations_owner
         FOREIGN KEY (owner_user_id) REFERENCES users(id)
         ON DELETE CASCADE
@@ -68,6 +78,11 @@ CREATE TABLE IF NOT EXISTS conversation_permissions (
 VALID_SHARE_SCOPES = {"private", "link_read", "link_write"}
 VALID_PERMISSIONS = {"read", "write"}
 DEFAULT_TITLE = "新对话"
+CONVERSATION_MANAGEMENT_COLUMNS = (
+    ("is_pinned", "BOOLEAN NOT NULL DEFAULT FALSE AFTER share_scope"),
+    ("pinned_at", "DATETIME(6) NULL AFTER is_pinned"),
+    ("is_visible", "BOOLEAN NOT NULL DEFAULT TRUE AFTER pinned_at"),
+)
 
 
 class ConversationNotFoundError(Exception):
@@ -95,6 +110,9 @@ class ConversationData:
     share_scope: str
     permission: str
     can_write: bool
+    is_pinned: bool
+    pinned_at: str | None
+    is_visible: bool
     created_at: str
     updated_at: str
     messages: list[ConversationMessage]
@@ -107,6 +125,9 @@ class ConversationSummary:
     share_scope: str
     permission: str
     can_write: bool
+    is_pinned: bool
+    pinned_at: str | None
+    is_visible: bool
     created_at: str
     updated_at: str
 
@@ -142,6 +163,26 @@ def _isoformat(value: object) -> str:
         normalized = normalized.replace(tzinfo=timezone.utc)
 
     return normalized.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _isoformat_optional(value: object) -> str | None:
+    if value is None:
+        return None
+
+    return _isoformat(value)
+
+
+def _as_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, bytes):
+        return value not in {b"", b"\x00", b"0"}
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "on"}
+
+    return bool(value)
 
 
 def _clean_title(title: str | None, messages: Sequence[ChatMessagePayload] = ()) -> str:
@@ -229,8 +270,85 @@ class ConversationService:
         with self._engine.begin() as connection:
             connection.execute(text(CREATE_USERS_SQL))
             connection.execute(text(CREATE_CONVERSATIONS_SQL))
+            self._ensure_conversation_management_columns(connection)
             connection.execute(text(CREATE_CONVERSATION_MESSAGES_SQL))
             connection.execute(text(CREATE_CONVERSATION_PERMISSIONS_SQL))
+
+    def _mysql_column_exists(
+        self,
+        connection: Connection,
+        table_name: str,
+        column_name: str,
+    ) -> bool:
+        count = connection.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                    AND TABLE_NAME = :table_name
+                    AND COLUMN_NAME = :column_name
+                """
+            ),
+            {"table_name": table_name, "column_name": column_name},
+        ).scalar_one()
+
+        return int(count) > 0
+
+    def _mysql_index_exists(
+        self,
+        connection: Connection,
+        table_name: str,
+        index_name: str,
+    ) -> bool:
+        count = connection.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM INFORMATION_SCHEMA.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE()
+                    AND TABLE_NAME = :table_name
+                    AND INDEX_NAME = :index_name
+                """
+            ),
+            {"table_name": table_name, "index_name": index_name},
+        ).scalar_one()
+
+        return int(count) > 0
+
+    def _ensure_conversation_management_columns(self, connection: Connection) -> None:
+        for column_name, column_definition in CONVERSATION_MANAGEMENT_COLUMNS:
+            if self._mysql_column_exists(connection, "conversations", column_name):
+                continue
+
+            connection.execute(
+                text(
+                    "ALTER TABLE conversations "
+                    f"ADD COLUMN {column_name} {column_definition}"
+                )
+            )
+
+        if self._mysql_index_exists(
+            connection,
+            "conversations",
+            "idx_conversations_owner_visible_pinned",
+        ):
+            return
+
+        connection.execute(
+            text(
+                """
+                ALTER TABLE conversations
+                ADD KEY idx_conversations_owner_visible_pinned (
+                    owner_user_id,
+                    is_visible,
+                    is_pinned,
+                    pinned_at,
+                    updated_at
+                )
+                """
+            )
+        )
 
     def _fetch_conversation_row(
         self,
@@ -246,6 +364,9 @@ class ConversationService:
                     c.owner_user_id,
                     c.title,
                     c.share_scope,
+                    c.is_pinned,
+                    c.pinned_at,
+                    c.is_visible,
                     c.created_at,
                     c.updated_at,
                     cp.permission AS user_permission
@@ -301,6 +422,9 @@ class ConversationService:
             share_scope=str(row["share_scope"]),
             permission=access.permission,
             can_write=access.can_write,
+            is_pinned=_as_bool(row["is_pinned"]),
+            pinned_at=_isoformat_optional(row["pinned_at"]),
+            is_visible=_as_bool(row["is_visible"]),
             created_at=_isoformat(row["created_at"]),
             updated_at=_isoformat(row["updated_at"]),
             messages=self._read_messages(connection, conversation_id),
@@ -316,6 +440,9 @@ class ConversationService:
                         c.owner_user_id,
                         c.title,
                         c.share_scope,
+                        c.is_pinned,
+                        c.pinned_at,
+                        c.is_visible,
                         c.created_at,
                         c.updated_at,
                         cp.permission AS user_permission
@@ -323,8 +450,14 @@ class ConversationService:
                     LEFT JOIN conversation_permissions cp
                         ON cp.conversation_id = c.id
                         AND cp.user_id = :user_id
-                    WHERE c.owner_user_id = :user_id OR cp.user_id = :user_id
-                    ORDER BY c.updated_at DESC
+                    WHERE c.is_visible = TRUE
+                        AND (c.owner_user_id = :user_id OR cp.user_id = :user_id)
+                    ORDER BY
+                        c.is_pinned DESC,
+                        CASE
+                            WHEN c.is_pinned THEN COALESCE(c.pinned_at, c.updated_at)
+                            ELSE c.updated_at
+                        END DESC
                     LIMIT 100
                     """
                 ),
@@ -341,6 +474,9 @@ class ConversationService:
                     share_scope=str(row["share_scope"]),
                     permission=access.permission,
                     can_write=access.can_write,
+                    is_pinned=_as_bool(row["is_pinned"]),
+                    pinned_at=_isoformat_optional(row["pinned_at"]),
+                    is_visible=_as_bool(row["is_visible"]),
                     created_at=_isoformat(row["created_at"]),
                     updated_at=_isoformat(row["updated_at"]),
                 )
@@ -352,7 +488,7 @@ class ConversationService:
         normalized_id = _ensure_uuid(conversation_id)
         with self._engine.connect() as connection:
             row = self._fetch_conversation_row(connection, normalized_id, user_id)
-            if row is None:
+            if row is None or not _as_bool(row["is_visible"]):
                 raise ConversationNotFoundError()
 
             access = _resolve_access(row, user_id)
@@ -403,6 +539,9 @@ class ConversationService:
                     },
                 )
             else:
+                if not _as_bool(row["is_visible"]):
+                    raise ConversationNotFoundError()
+
                 access = _resolve_access(row, user_id)
                 if not access.can_write:
                     raise ConversationPermissionError()
@@ -521,6 +660,9 @@ class ConversationService:
                     },
                 )
             else:
+                if not _as_bool(row["is_visible"]):
+                    raise ConversationNotFoundError()
+
                 access = _resolve_access(row, user_id)
                 if not access.can_write:
                     raise ConversationPermissionError()
@@ -634,7 +776,7 @@ class ConversationService:
 
         with self._engine.begin() as connection:
             row = self._fetch_conversation_row(connection, normalized_id, user_id)
-            if row is None:
+            if row is None or not _as_bool(row["is_visible"]):
                 raise ConversationNotFoundError()
 
             access = _resolve_access(row, user_id)
@@ -658,6 +800,105 @@ class ConversationService:
             )
 
         return self.get_conversation(normalized_id, user_id)
+
+    def rename_conversation(
+        self,
+        conversation_id: str,
+        user_id: int,
+        title: str,
+    ) -> ConversationData:
+        normalized_id = _ensure_uuid(conversation_id)
+        now = _now_utc()
+
+        with self._engine.begin() as connection:
+            row = self._fetch_conversation_row(connection, normalized_id, user_id)
+            if row is None or not _as_bool(row["is_visible"]):
+                raise ConversationNotFoundError()
+
+            access = _resolve_access(row, user_id)
+            if access.permission != "owner":
+                raise ConversationPermissionError()
+
+            connection.execute(
+                text(
+                    """
+                    UPDATE conversations
+                    SET title = :title,
+                        updated_at = :now
+                    WHERE id = :conversation_id
+                    """
+                ),
+                {
+                    "conversation_id": normalized_id,
+                    "title": _clean_title(title),
+                    "now": now,
+                },
+            )
+
+        return self.get_conversation(normalized_id, user_id)
+
+    def update_pin_state(
+        self,
+        conversation_id: str,
+        user_id: int,
+        is_pinned: bool,
+    ) -> ConversationData:
+        normalized_id = _ensure_uuid(conversation_id)
+        now = _now_utc()
+
+        with self._engine.begin() as connection:
+            row = self._fetch_conversation_row(connection, normalized_id, user_id)
+            if row is None or not _as_bool(row["is_visible"]):
+                raise ConversationNotFoundError()
+
+            access = _resolve_access(row, user_id)
+            if access.permission != "owner":
+                raise ConversationPermissionError()
+
+            connection.execute(
+                text(
+                    """
+                    UPDATE conversations
+                    SET is_pinned = :is_pinned,
+                        pinned_at = :pinned_at,
+                        updated_at = :now
+                    WHERE id = :conversation_id
+                    """
+                ),
+                {
+                    "conversation_id": normalized_id,
+                    "is_pinned": is_pinned,
+                    "pinned_at": now if is_pinned else None,
+                    "now": now,
+                },
+            )
+
+        return self.get_conversation(normalized_id, user_id)
+
+    def hide_conversation(self, conversation_id: str, user_id: int) -> None:
+        normalized_id = _ensure_uuid(conversation_id)
+        now = _now_utc()
+
+        with self._engine.begin() as connection:
+            row = self._fetch_conversation_row(connection, normalized_id, user_id)
+            if row is None or not _as_bool(row["is_visible"]):
+                raise ConversationNotFoundError()
+
+            access = _resolve_access(row, user_id)
+            if access.permission != "owner":
+                raise ConversationPermissionError()
+
+            connection.execute(
+                text(
+                    """
+                    UPDATE conversations
+                    SET is_visible = FALSE,
+                        updated_at = :now
+                    WHERE id = :conversation_id
+                    """
+                ),
+                {"conversation_id": normalized_id, "now": now},
+            )
 
 
 @lru_cache(maxsize=1)

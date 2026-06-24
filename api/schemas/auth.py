@@ -10,6 +10,7 @@ class UserProfile(BaseModel):
     id: int
     username: str
     email: str
+    avatar_sha256: str
     display_name: str
 
 

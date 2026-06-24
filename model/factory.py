@@ -21,11 +21,11 @@ class BaseModelFactory(ABC):
 
 class webChatModelFactory(BaseModelFactory):
     def generator(self):
-        return ChatOpenAI(model_name=os.getenv("deepseek_modelname"),base_url=os.getenv("deepseek_baseurl"), api_key=os.getenv("deepseek_api_key"))
+        return ChatOpenAI(model_name=os.getenv("DEEPSEEK_MODELNAME"),base_url=os.getenv("DEEPSEEK_BASEURL"), api_key=os.getenv("DEEPSEEK_API_KEY"))
 
 class bendiChatModelFactory(BaseModelFactory):
     def generator(self):
-        return ChatOllama(model=os.getenv("Ollama_modelname"))
+        return ChatOllama(model=os.getenv("OLLAMA_MODELNAME"))
 
 PROJECT_ROOT = Path(__file__).parent.parent
 
@@ -43,5 +43,4 @@ class EmbeddingsFactory(BaseModelFactory):
         )
 
 webchat_model = webChatModelFactory().generator()
-bendichat_model = bendiChatModelFactory().generator()
 embedding_model=EmbeddingsFactory().generator()
