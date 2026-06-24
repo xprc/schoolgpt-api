@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from api.core.settings import get_settings
 from api.routes.auth import router as auth_router
 from api.routes.chat import router as chat_router
+from api.routes.conversations import router as conversations_router
 
 
 def create_app() -> FastAPI:
@@ -20,6 +21,7 @@ def create_app() -> FastAPI:
 
     app.include_router(auth_router, prefix=settings.api_prefix)
     app.include_router(chat_router, prefix=settings.api_prefix)
+    app.include_router(conversations_router, prefix=settings.api_prefix)
     return app
 
 
