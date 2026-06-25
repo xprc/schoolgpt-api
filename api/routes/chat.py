@@ -13,6 +13,7 @@ from api.services.conversation_service import (
     get_conversation_service,
 )
 from api.services.chat_service import ChatService, get_chat_service
+from model.factory import ModelConfigurationError
 
 router = APIRouter(
     prefix="/chat",
@@ -28,6 +29,14 @@ async def stream_chat(
     conversation_service: ConversationService = Depends(get_conversation_service),
     settings: Settings = Depends(get_settings),
 ) -> StreamingResponse:
+    try:
+        service.ensure_ready()
+    except ModelConfigurationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
     if request.conversation_id:
         try:
             conversation = conversation_service.get_conversation(

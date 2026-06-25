@@ -8,7 +8,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.engine.url import make_url
 
-from api.core.settings import Settings, get_settings
+from api.core.settings import get_database_url
 from api.schemas.chat import ChatMessagePayload, ConversationShareScope
 from api.services.user_service import CREATE_USERS_SQL
 
@@ -133,6 +133,27 @@ class ConversationSummary:
 
 
 @dataclass(frozen=True)
+class AdminConversationSummary:
+    id: str
+    title: str
+    owner_user_id: int
+    owner_username: str
+    owner_email: str
+    share_scope: str
+    is_visible: bool
+    message_count: int
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class ConversationTotals:
+    total_conversations: int
+    visible_conversations: int
+    total_messages: int
+
+
+@dataclass(frozen=True)
 class ConversationAccess:
     permission: str
     can_write: bool
@@ -233,10 +254,11 @@ def _resolve_access(row: Mapping[str, object], user_id: int) -> ConversationAcce
 
 
 class ConversationService:
-    def __init__(self, settings: Settings) -> None:
-        self._ensure_mysql_database(settings.database_url)
+    def __init__(self) -> None:
+        database_url = get_database_url()
+        self._ensure_mysql_database(database_url)
         self._engine = create_engine(
-            settings.database_url,
+            database_url,
             pool_pre_ping=True,
             pool_recycle=1800,
             future=True,
@@ -270,7 +292,6 @@ class ConversationService:
         with self._engine.begin() as connection:
             connection.execute(text(CREATE_USERS_SQL))
             connection.execute(text(CREATE_CONVERSATIONS_SQL))
-            self._ensure_conversation_management_columns(connection)
             connection.execute(text(CREATE_CONVERSATION_MESSAGES_SQL))
             connection.execute(text(CREATE_CONVERSATION_PERMISSIONS_SQL))
 
@@ -900,7 +921,176 @@ class ConversationService:
                 {"conversation_id": normalized_id, "now": now},
             )
 
+    def list_admin_conversations(self) -> list[AdminConversationSummary]:
+        with self._engine.connect() as connection:
+            rows = connection.execute(
+                text(
+                    """
+                    SELECT
+                        c.id,
+                        c.title,
+                        c.owner_user_id,
+                        u.username AS owner_username,
+                        u.email AS owner_email,
+                        c.share_scope,
+                        c.is_visible,
+                        c.created_at,
+                        c.updated_at,
+                        COUNT(cm.id) AS message_count
+                    FROM conversations c
+                    INNER JOIN users u ON u.id = c.owner_user_id
+                    LEFT JOIN conversation_messages cm ON cm.conversation_id = c.id
+                    GROUP BY
+                        c.id,
+                        c.title,
+                        c.owner_user_id,
+                        u.username,
+                        u.email,
+                        c.share_scope,
+                        c.is_visible,
+                        c.created_at,
+                        c.updated_at
+                    ORDER BY c.updated_at DESC
+                    LIMIT 500
+                    """
+                )
+            ).mappings().fetchall()
+
+        return [
+            AdminConversationSummary(
+                id=str(row["id"]),
+                title=str(row["title"]),
+                owner_user_id=int(row["owner_user_id"]),
+                owner_username=str(row["owner_username"]),
+                owner_email=str(row["owner_email"]),
+                share_scope=str(row["share_scope"]),
+                is_visible=_as_bool(row["is_visible"]),
+                message_count=int(row["message_count"] or 0),
+                created_at=_isoformat(row["created_at"]),
+                updated_at=_isoformat(row["updated_at"]),
+            )
+            for row in rows
+        ]
+
+    def get_admin_conversation(self, conversation_id: str) -> AdminConversationSummary | None:
+        normalized_id = _ensure_uuid(conversation_id)
+        with self._engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    """
+                    SELECT
+                        c.id,
+                        c.title,
+                        c.owner_user_id,
+                        u.username AS owner_username,
+                        u.email AS owner_email,
+                        c.share_scope,
+                        c.is_visible,
+                        c.created_at,
+                        c.updated_at,
+                        COUNT(cm.id) AS message_count
+                    FROM conversations c
+                    INNER JOIN users u ON u.id = c.owner_user_id
+                    LEFT JOIN conversation_messages cm ON cm.conversation_id = c.id
+                    WHERE c.id = :conversation_id
+                    GROUP BY
+                        c.id,
+                        c.title,
+                        c.owner_user_id,
+                        u.username,
+                        u.email,
+                        c.share_scope,
+                        c.is_visible,
+                        c.created_at,
+                        c.updated_at
+                    """
+                ),
+                {"conversation_id": normalized_id},
+            ).mappings().fetchone()
+
+        if row is None:
+            return None
+
+        return AdminConversationSummary(
+            id=str(row["id"]),
+            title=str(row["title"]),
+            owner_user_id=int(row["owner_user_id"]),
+            owner_username=str(row["owner_username"]),
+            owner_email=str(row["owner_email"]),
+            share_scope=str(row["share_scope"]),
+            is_visible=_as_bool(row["is_visible"]),
+            message_count=int(row["message_count"] or 0),
+            created_at=_isoformat(row["created_at"]),
+            updated_at=_isoformat(row["updated_at"]),
+        )
+
+    def update_admin_visibility(
+        self,
+        conversation_id: str,
+        is_visible: bool,
+    ) -> AdminConversationSummary | None:
+        normalized_id = _ensure_uuid(conversation_id)
+        now = _now_utc()
+
+        with self._engine.begin() as connection:
+            result = connection.execute(
+                text(
+                    """
+                    UPDATE conversations
+                    SET is_visible = :is_visible,
+                        updated_at = :now
+                    WHERE id = :conversation_id
+                    """
+                ),
+                {
+                    "conversation_id": normalized_id,
+                    "is_visible": is_visible,
+                    "now": now,
+                },
+            )
+            if result.rowcount == 0:
+                return None
+
+        return self.get_admin_conversation(normalized_id)
+
+    def delete_admin_conversation(self, conversation_id: str) -> bool:
+        normalized_id = _ensure_uuid(conversation_id)
+        with self._engine.begin() as connection:
+            result = connection.execute(
+                text(
+                    """
+                    DELETE FROM conversations
+                    WHERE id = :conversation_id
+                    """
+                ),
+                {"conversation_id": normalized_id},
+            )
+
+        return result.rowcount > 0
+
+    def get_conversation_totals(self) -> ConversationTotals:
+        with self._engine.connect() as connection:
+            conversation_row = connection.execute(
+                text(
+                    """
+                    SELECT
+                        COUNT(*) AS total_conversations,
+                        SUM(CASE WHEN is_visible THEN 1 ELSE 0 END) AS visible_conversations
+                    FROM conversations
+                    """
+                )
+            ).mappings().one()
+            message_count = connection.execute(
+                text("SELECT COUNT(*) FROM conversation_messages")
+            ).scalar_one()
+
+        return ConversationTotals(
+            total_conversations=int(conversation_row["total_conversations"] or 0),
+            visible_conversations=int(conversation_row["visible_conversations"] or 0),
+            total_messages=int(message_count or 0),
+        )
+
 
 @lru_cache(maxsize=1)
 def get_conversation_service() -> ConversationService:
-    return ConversationService(get_settings())
+    return ConversationService()

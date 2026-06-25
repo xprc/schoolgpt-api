@@ -150,6 +150,7 @@ activemq-data/
 # Environments
 .env
 .envrc
+config/runtime_setup.json
 .venv
 env/
 venv/

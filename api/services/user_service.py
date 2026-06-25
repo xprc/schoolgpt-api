@@ -1,5 +1,6 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import lru_cache
 from hashlib import sha256
 
@@ -8,7 +9,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.engine.url import make_url
 
-from api.core.settings import Settings, get_settings
+from api.core.settings import get_database_url
 
 
 CREATE_USERS_SQL = """
@@ -19,6 +20,7 @@ CREATE TABLE IF NOT EXISTS users (
     avatar_sha256 CHAR(64) NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
     display_name VARCHAR(120) NOT NULL,
+    user_type VARCHAR(16) NOT NULL DEFAULT 'student',
     is_active TINYINT(1) NOT NULL DEFAULT 1,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -30,6 +32,8 @@ CREATE TABLE IF NOT EXISTS users (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 """
 
+VALID_USER_TYPES = {"student", "teacher", "maintenance", "admin"}
+
 
 @dataclass(frozen=True)
 class User:
@@ -38,7 +42,22 @@ class User:
     email: str
     avatar_sha256: str
     display_name: str
+    user_type: str
     is_active: bool
+
+
+@dataclass(frozen=True)
+class AdminUser:
+    id: int
+    username: str
+    email: str
+    avatar_sha256: str
+    display_name: str
+    user_type: str
+    is_active: bool
+    created_at: str
+    updated_at: str
+    last_login_at: str | None
 
 
 def _hash_password(password: str) -> str:
@@ -61,6 +80,33 @@ def _quote_mysql_identifier(identifier: str) -> str:
     return "`" + identifier.replace("`", "``") + "`"
 
 
+def _isoformat(value: object) -> str:
+    if isinstance(value, datetime):
+        normalized = value
+    else:
+        normalized = datetime.now(timezone.utc)
+
+    if normalized.tzinfo is None:
+        normalized = normalized.replace(tzinfo=timezone.utc)
+
+    return normalized.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _isoformat_optional(value: object) -> str | None:
+    if value is None:
+        return None
+
+    return _isoformat(value)
+
+
+def _normalize_user_type(user_type: str | None) -> str:
+    normalized_user_type = (user_type or "").strip().lower()
+    if normalized_user_type not in VALID_USER_TYPES:
+        raise ValueError("Invalid user type")
+
+    return normalized_user_type
+
+
 def _row_to_user(row: Mapping[str, object]) -> User:
     return User(
         id=int(row["id"]),
@@ -68,16 +114,32 @@ def _row_to_user(row: Mapping[str, object]) -> User:
         email=str(row["email"]),
         avatar_sha256=str(row["avatar_sha256"]),
         display_name=str(row["display_name"]),
+        user_type=str(row.get("user_type") or "student"),
         is_active=bool(row["is_active"]),
     )
 
 
+def _row_to_admin_user(row: Mapping[str, object]) -> AdminUser:
+    return AdminUser(
+        id=int(row["id"]),
+        username=str(row["username"]),
+        email=str(row["email"]),
+        avatar_sha256=str(row["avatar_sha256"]),
+        display_name=str(row["display_name"]),
+        user_type=str(row["user_type"]),
+        is_active=bool(row["is_active"]),
+        created_at=_isoformat(row["created_at"]),
+        updated_at=_isoformat(row["updated_at"]),
+        last_login_at=_isoformat_optional(row["last_login_at"]),
+    )
+
+
 class UserService:
-    def __init__(self, settings: Settings) -> None:
-        self._settings = settings
-        self._ensure_mysql_database(settings.database_url)
+    def __init__(self) -> None:
+        database_url = get_database_url()
+        self._ensure_mysql_database(database_url)
         self._engine = create_engine(
-            settings.database_url,
+            database_url,
             pool_pre_ping=True,
             pool_recycle=1800,
             future=True,
@@ -110,11 +172,6 @@ class UserService:
     def _initialize_database(self) -> None:
         with self._engine.begin() as connection:
             connection.execute(text(CREATE_USERS_SQL))
-            self._ensure_avatar_sha256_column(connection)
-            self._backfill_avatar_sha256(connection)
-            self._ensure_avatar_sha256_index(connection)
-
-        self._ensure_default_user()
 
     def _mysql_column_exists(self, connection: Connection, column_name: str) -> bool:
         if self._engine.dialect.name != "mysql":
@@ -180,6 +237,54 @@ class UserService:
                 )
             )
 
+    def _ensure_user_type_column(self, connection: Connection) -> None:
+        if self._engine.dialect.name != "mysql":
+            return
+
+        if not self._mysql_column_exists(connection, "user_type"):
+            connection.execute(
+                text(
+                    """
+                    ALTER TABLE users
+                    ADD COLUMN user_type VARCHAR(16) NOT NULL DEFAULT 'student' AFTER display_name
+                    """
+                )
+            )
+
+        connection.execute(
+            text(
+                """
+                UPDATE users
+                SET user_type = 'admin'
+                WHERE username = 'admin' OR email = 'admin@schoolgpt.local'
+                """
+            )
+        )
+
+    def _ensure_admin_user_exists(self, connection: Connection) -> None:
+        admin_count = connection.execute(
+            text("SELECT COUNT(*) FROM users WHERE user_type = 'admin'")
+        ).scalar_one()
+        if int(admin_count) > 0:
+            return
+
+        first_user_id = connection.execute(
+            text("SELECT id FROM users ORDER BY id ASC LIMIT 1")
+        ).scalar_one_or_none()
+        if first_user_id is None:
+            return
+
+        connection.execute(
+            text(
+                """
+                UPDATE users
+                SET user_type = 'admin'
+                WHERE id = :user_id
+                """
+            ),
+            {"user_id": int(first_user_id)},
+        )
+
     def _backfill_avatar_sha256(self, connection: Connection) -> None:
         if self._engine.dialect.name != "mysql":
             return
@@ -202,29 +307,17 @@ class UserService:
             )
         )
 
-    def _ensure_default_user(self) -> None:
-        with self._engine.connect() as connection:
-            user_count = connection.execute(text("SELECT COUNT(*) FROM users")).scalar_one()
-
-        if user_count > 0:
-            return
-
-        self.create_user(
-            username=self._settings.default_username,
-            email=self._settings.default_email,
-            password=self._settings.default_password,
-            display_name=self._settings.default_display_name,
-        )
-
     def create_user(
         self,
         username: str,
         email: str,
         password: str,
         display_name: str,
+        user_type: str = "student",
     ) -> User:
         password_hash = _hash_password(password)
         avatar_sha256 = _email_to_avatar_sha256(email)
+        normalized_user_type = _normalize_user_type(user_type)
 
         with self._engine.begin() as connection:
             cursor = connection.execute(
@@ -235,14 +328,16 @@ class UserService:
                         email,
                         avatar_sha256,
                         password_hash,
-                        display_name
+                        display_name,
+                        user_type
                     )
                     VALUES (
                         :username,
                         :email,
                         :avatar_sha256,
                         :password_hash,
-                        :display_name
+                        :display_name,
+                        :user_type
                     )
                     """
                 ),
@@ -252,6 +347,7 @@ class UserService:
                     "avatar_sha256": avatar_sha256,
                     "password_hash": password_hash,
                     "display_name": display_name,
+                    "user_type": normalized_user_type,
                 },
             )
             user_id = int(cursor.lastrowid or 0)
@@ -278,6 +374,7 @@ class UserService:
                         avatar_sha256,
                         password_hash,
                         display_name,
+                        user_type,
                         is_active
                     FROM users
                     WHERE username = :identifier OR email = :identifier
@@ -311,7 +408,14 @@ class UserService:
             row = connection.execute(
                 text(
                     """
-                    SELECT id, username, email, avatar_sha256, display_name, is_active
+                    SELECT
+                        id,
+                        username,
+                        email,
+                        avatar_sha256,
+                        display_name,
+                        user_type,
+                        is_active
                     FROM users
                     WHERE id = :user_id
                     """
@@ -324,7 +428,185 @@ class UserService:
 
         return _row_to_user(row)
 
+    def list_admin_users(self) -> list[AdminUser]:
+        with self._engine.connect() as connection:
+            rows = connection.execute(
+                text(
+                    """
+                    SELECT
+                        id,
+                        username,
+                        email,
+                        avatar_sha256,
+                        display_name,
+                        user_type,
+                        is_active,
+                        created_at,
+                        updated_at,
+                        last_login_at
+                    FROM users
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 500
+                    """
+                )
+            ).mappings().fetchall()
+
+        return [_row_to_admin_user(row) for row in rows]
+
+    def create_admin_user(
+        self,
+        username: str,
+        email: str,
+        password: str,
+        display_name: str,
+        user_type: str,
+        is_active: bool,
+    ) -> AdminUser:
+        user = self.create_user(
+            username=username.strip(),
+            email=email.strip(),
+            password=password,
+            display_name=display_name.strip(),
+            user_type=user_type,
+        )
+        self.update_admin_user(
+            user_id=user.id,
+            username=user.username,
+            email=user.email,
+            display_name=user.display_name,
+            user_type=user.user_type,
+            is_active=is_active,
+        )
+        admin_user = self.get_admin_user_by_id(user.id)
+        if admin_user is None:
+            raise RuntimeError("User creation failed")
+
+        return admin_user
+
+    def get_admin_user_by_id(self, user_id: int) -> AdminUser | None:
+        with self._engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    """
+                    SELECT
+                        id,
+                        username,
+                        email,
+                        avatar_sha256,
+                        display_name,
+                        user_type,
+                        is_active,
+                        created_at,
+                        updated_at,
+                        last_login_at
+                    FROM users
+                    WHERE id = :user_id
+                    """
+                ),
+                {"user_id": user_id},
+            ).mappings().fetchone()
+
+        if row is None:
+            return None
+
+        return _row_to_admin_user(row)
+
+    def update_admin_user(
+        self,
+        user_id: int,
+        username: str,
+        email: str,
+        display_name: str,
+        user_type: str,
+        is_active: bool,
+    ) -> AdminUser | None:
+        normalized_user_type = _normalize_user_type(user_type)
+        avatar_sha256 = _email_to_avatar_sha256(email)
+
+        with self._engine.begin() as connection:
+            result = connection.execute(
+                text(
+                    """
+                    UPDATE users
+                    SET username = :username,
+                        email = :email,
+                        avatar_sha256 = :avatar_sha256,
+                        display_name = :display_name,
+                        user_type = :user_type,
+                        is_active = :is_active,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = :user_id
+                    """
+                ),
+                {
+                    "user_id": user_id,
+                    "username": username.strip(),
+                    "email": email.strip(),
+                    "avatar_sha256": avatar_sha256,
+                    "display_name": display_name.strip(),
+                    "user_type": normalized_user_type,
+                    "is_active": is_active,
+                },
+            )
+            if result.rowcount == 0:
+                return None
+
+        return self.get_admin_user_by_id(user_id)
+
+    def update_admin_user_password(self, user_id: int, password: str) -> bool:
+        password_hash = _hash_password(password)
+        with self._engine.begin() as connection:
+            result = connection.execute(
+                text(
+                    """
+                    UPDATE users
+                    SET password_hash = :password_hash,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = :user_id
+                    """
+                ),
+                {"user_id": user_id, "password_hash": password_hash},
+            )
+
+        return result.rowcount > 0
+
+    def get_user_type_counts(self) -> dict[str, int]:
+        with self._engine.connect() as connection:
+            rows = connection.execute(
+                text(
+                    """
+                    SELECT user_type, COUNT(*) AS user_count
+                    FROM users
+                    GROUP BY user_type
+                    """
+                )
+            ).mappings().fetchall()
+
+        counts = {user_type: 0 for user_type in VALID_USER_TYPES}
+        for row in rows:
+            counts[str(row["user_type"])] = int(row["user_count"])
+
+        return counts
+
+    def get_user_totals(self) -> dict[str, int]:
+        with self._engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    """
+                    SELECT
+                        COUNT(*) AS total_users,
+                        SUM(CASE WHEN is_active THEN 1 ELSE 0 END) AS active_users
+                    FROM users
+                    """
+                )
+            ).mappings().one()
+
+        return {
+            "total_users": int(row["total_users"] or 0),
+            "active_users": int(row["active_users"] or 0),
+        }
+
 
 @lru_cache(maxsize=1)
 def get_user_service() -> UserService:
-    return UserService(get_settings())
+    return UserService()

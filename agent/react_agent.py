@@ -1,14 +1,14 @@
 from langchain.agents import create_agent
 from agent.tools.middleware import monitor_tool, log_before_model, report_prompt_switch
 from agent.tools.agent_tools import rag_summarize
-from model.factory import webchat_model
+from model.factory import create_webchat_model
 from utils.prompt_loader import load_system_prompt
 
 
 class ReactAgent(object):
-    def __init__(self):
+    def __init__(self, model=None):
         self.agent = create_agent(
-            model=webchat_model,
+            model=model or create_webchat_model(),
             system_prompt=load_system_prompt(),
             tools=[rag_summarize],
             middleware=[monitor_tool, log_before_model, report_prompt_switch],

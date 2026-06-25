@@ -1,8 +1,40 @@
+import json
 import os
 from functools import lru_cache
+from pathlib import Path
 from urllib.parse import quote_plus
 
 from pydantic import BaseModel
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SETUP_CONFIG_PATH = PROJECT_ROOT / "config" / "runtime_setup.json"
+
+
+class SetupRequiredError(Exception):
+    pass
+
+
+class FirstRunDatabaseConfig(BaseModel):
+    host: str
+    port: int
+    username: str
+    password: str
+    database: str
+
+    @property
+    def database_url(self) -> str:
+        username = quote_plus(self.username)
+        password = quote_plus(self.password)
+        database = quote_plus(self.database)
+        credentials = f"{username}:{password}" if password else username
+        return (
+            f"mysql+pymysql://{credentials}@{self.host}:{self.port}/"
+            f"{database}?charset=utf8mb4"
+        )
+
+
+class FirstRunSetupConfig(BaseModel):
+    database: FirstRunDatabaseConfig
 
 
 def _split_env_list(value: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -35,18 +67,42 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
-def _default_database_url() -> str:
-    username = quote_plus(os.getenv("SCHOOLGPT_MYSQL_USER", "root"))
-    password = quote_plus(os.getenv("SCHOOLGPT_MYSQL_PASSWORD", ""))
-    host = os.getenv("SCHOOLGPT_MYSQL_HOST", "127.0.0.1")
-    port = os.getenv("SCHOOLGPT_MYSQL_PORT", "3306")
-    database = quote_plus(os.getenv("SCHOOLGPT_MYSQL_DATABASE", "schoolgpt"))
-    credentials = f"{username}:{password}" if password else username
-    return f"mysql+pymysql://{credentials}@{host}:{port}/{database}?charset=utf8mb4"
+def load_setup_config() -> FirstRunSetupConfig | None:
+    if not SETUP_CONFIG_PATH.exists():
+        return None
+
+    with SETUP_CONFIG_PATH.open("r", encoding="utf-8") as config_file:
+        payload = json.load(config_file)
+
+    return FirstRunSetupConfig(**payload)
 
 
-def _env_database_url() -> str:
-    return os.getenv("SCHOOLGPT_DATABASE_URL", _default_database_url())
+def is_setup_complete() -> bool:
+    return load_setup_config() is not None
+
+
+def save_setup_config(database_config: FirstRunDatabaseConfig) -> None:
+    SETUP_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "database": {
+            "host": database_config.host,
+            "port": database_config.port,
+            "username": database_config.username,
+            "password": database_config.password,
+            "database": database_config.database,
+        }
+    }
+    with SETUP_CONFIG_PATH.open("w", encoding="utf-8") as config_file:
+        json.dump(payload, config_file, ensure_ascii=False, indent=2)
+        config_file.write("\n")
+
+
+def get_database_url() -> str:
+    setup_config = load_setup_config()
+    if setup_config is None:
+        raise SetupRequiredError("首次运行配置未完成")
+
+    return setup_config.database.database_url
 
 
 class Settings(BaseModel):
@@ -56,11 +112,6 @@ class Settings(BaseModel):
     api_token: str
     auth_secret_key: str
     access_token_expire_minutes: int
-    database_url: str
-    default_username: str
-    default_email: str
-    default_password: str
-    default_display_name: str
     cors_origins: tuple[str, ...]
     stream_delay_seconds: float
 
@@ -77,11 +128,6 @@ def get_settings() -> Settings:
             os.getenv("SCHOOLGPT_API_TOKEN", "my-super-secret-token"),
         ),
         access_token_expire_minutes=_int_env("SCHOOLGPT_ACCESS_TOKEN_EXPIRE_MINUTES", 1440),
-        database_url=_env_database_url(),
-        default_username=os.getenv("SCHOOLGPT_DEFAULT_USERNAME", "admin"),
-        default_email=os.getenv("SCHOOLGPT_DEFAULT_EMAIL", "admin@schoolgpt.local"),
-        default_password=os.getenv("SCHOOLGPT_DEFAULT_PASSWORD", "admin123456"),
-        default_display_name=os.getenv("SCHOOLGPT_DEFAULT_DISPLAY_NAME", "校园百事通管理员"),
         cors_origins=_split_env_list(
             os.getenv("SCHOOLGPT_CORS_ORIGINS"),
             ("http://localhost:5173", "http://127.0.0.1:5173"),

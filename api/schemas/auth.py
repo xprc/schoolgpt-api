@@ -12,6 +12,7 @@ class UserProfile(BaseModel):
     email: str
     avatar_sha256: str
     display_name: str
+    user_type: str
 
 
 class LoginResponse(BaseModel):
