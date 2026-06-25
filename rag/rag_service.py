@@ -5,14 +5,14 @@ from api.services.model_config_service import get_model_config_service
 from model.factory import create_webchat_model
 from rag.source_context import add_rag_sources
 from rag.vector_store import get_vector_store_service
-from utils.prompt_loader import load_rag_prompt
+from utils.prompt_loader import load_policy_rag_search_prompt
 
 
-class RagSummarylize(object):
+class PolicyRagSearchService(object):
     def __init__(self):
         self.vector_store = get_vector_store_service()
         self.retriever = self.vector_store.get_retriever()
-        self.prompt_text = load_rag_prompt()
+        self.prompt_text = load_policy_rag_search_prompt()
         self.prompt_template = PromptTemplate.from_template(self.prompt_text)
         self.chain = None
         self.model_cache_key = None
@@ -28,7 +28,7 @@ class RagSummarylize(object):
     def retriever_docs(self, query):
         return self.vector_store.similarity_search_with_sources(query)
 
-    def rag_summarize(self, query):
+    def policy_rag_search(self, query):
         context_docs = self.retriever_docs(query)
         add_rag_sources([
             {

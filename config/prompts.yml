@@ -1,4 +1,4 @@
 
-rag_summarize_prompt_path: prompts/rag_summarize.txt
+policy_rag_search_prompt_path: prompts/policy_rag_search.txt
 main_prompt_path: prompts/main_prompt.txt
 report_prompt_path: prompts/report_prompt.txt

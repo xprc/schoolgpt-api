@@ -37,18 +37,18 @@ def load_report_prompt():
         raise e
 
 
-def load_rag_prompt():
+def load_policy_rag_search_prompt():
     try:
-        rag_prompt_path = get_abs_path(prompts_conf["rag_summarize_prompt_path"])
+        rag_prompt_path = get_abs_path(prompts_conf["policy_rag_search_prompt_path"])
     except KeyError as e:
-        logger.error(f"[rag_prompt_path]解析系统提示词文件路径失败。")
+        logger.error(f"[policy_rag_search_prompt_path]解析系统提示词文件路径失败。")
         raise e
 
     try:
         return open(rag_prompt_path, "r", encoding="utf-8").read()
     except FileNotFoundError as e:
-        logger.error(f"[rag_prompt_path]报告提示词文件{rag_prompt_path}不存在. {str(e)}")
+        logger.error(f"[policy_rag_search_prompt_path]报告提示词文件{rag_prompt_path}不存在. {str(e)}")
         raise e
     except Exception as e:
-        logger.error(f"[rag_prompt_path]解析报告提示词{rag_prompt_path}失败. {str(e)}")
+        logger.error(f"[policy_rag_search_prompt_path]解析报告提示词{rag_prompt_path}失败. {str(e)}")
         raise e

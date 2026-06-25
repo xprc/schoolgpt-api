@@ -1,6 +1,6 @@
 from langchain.agents import create_agent
 from agent.tools.middleware import monitor_tool, log_before_model, report_prompt_switch
-from agent.tools.agent_tools import rag_summarize
+from agent.tools.agent_tools import policy_rag_search
 from model.factory import create_webchat_model
 from utils.prompt_loader import load_system_prompt
 
@@ -10,7 +10,7 @@ class ReactAgent(object):
         self.agent = create_agent(
             model=model or create_webchat_model(),
             system_prompt=load_system_prompt(),
-            tools=[rag_summarize],
+            tools=[policy_rag_search],
             middleware=[monitor_tool, log_before_model, report_prompt_switch],
         )
 
