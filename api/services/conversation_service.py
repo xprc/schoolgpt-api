@@ -1,3 +1,4 @@
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -45,6 +46,7 @@ CREATE TABLE IF NOT EXISTS conversation_messages (
     conversation_id CHAR(36) NOT NULL,
     role VARCHAR(16) NOT NULL,
     content MEDIUMTEXT NOT NULL,
+    rag_sources_json JSON NULL,
     position INT UNSIGNED NOT NULL,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
@@ -83,6 +85,9 @@ CONVERSATION_MANAGEMENT_COLUMNS = (
     ("pinned_at", "DATETIME(6) NULL AFTER is_pinned"),
     ("is_visible", "BOOLEAN NOT NULL DEFAULT TRUE AFTER pinned_at"),
 )
+CONVERSATION_MESSAGE_COLUMNS = (
+    ("rag_sources_json", "JSON NULL AFTER content"),
+)
 
 
 class ConversationNotFoundError(Exception):
@@ -98,6 +103,7 @@ class ConversationMessage:
     id: str
     role: str
     content: str
+    rag_sources: list[dict[str, object]]
     created_at: str
     updated_at: str
 
@@ -253,6 +259,67 @@ def _resolve_access(row: Mapping[str, object], user_id: int) -> ConversationAcce
     raise ConversationNotFoundError()
 
 
+def _normalize_rag_sources(
+    sources: Sequence[Mapping[str, object]] | None,
+) -> list[dict[str, object]]:
+    if not sources:
+        return []
+
+    normalized_sources = []
+    for source in sources:
+        file_name = str(source.get("file_name", "")).strip()
+        if not file_name:
+            continue
+
+        try:
+            confidence = float(source.get("confidence", 0) or 0)
+        except (TypeError, ValueError):
+            confidence = 0
+
+        normalized_sources.append(
+            {
+                "file_name": file_name,
+                "confidence": max(0, min(1, confidence)),
+            }
+        )
+
+    return normalized_sources
+
+
+def _serialize_rag_sources(
+    sources: Sequence[Mapping[str, object]] | None,
+) -> str | None:
+    normalized_sources = _normalize_rag_sources(sources)
+    if not normalized_sources:
+        return None
+
+    return json.dumps(normalized_sources, ensure_ascii=False)
+
+
+def _parse_rag_sources(value: object) -> list[dict[str, object]]:
+    if value is None:
+        return []
+
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="ignore")
+
+    if isinstance(value, str):
+        if not value.strip():
+            return []
+
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+
+    if not isinstance(value, list):
+        return []
+
+    return _normalize_rag_sources(
+        [source for source in value if isinstance(source, Mapping)]
+    )
+
+
 class ConversationService:
     def __init__(self) -> None:
         database_url = get_database_url()
@@ -294,6 +361,8 @@ class ConversationService:
             connection.execute(text(CREATE_CONVERSATIONS_SQL))
             connection.execute(text(CREATE_CONVERSATION_MESSAGES_SQL))
             connection.execute(text(CREATE_CONVERSATION_PERMISSIONS_SQL))
+            self._ensure_conversation_management_columns(connection)
+            self._ensure_conversation_message_columns(connection)
 
     def _mysql_column_exists(
         self,
@@ -371,6 +440,18 @@ class ConversationService:
             )
         )
 
+    def _ensure_conversation_message_columns(self, connection: Connection) -> None:
+        for column_name, column_definition in CONVERSATION_MESSAGE_COLUMNS:
+            if self._mysql_column_exists(connection, "conversation_messages", column_name):
+                continue
+
+            connection.execute(
+                text(
+                    "ALTER TABLE conversation_messages "
+                    f"ADD COLUMN {column_name} {column_definition}"
+                )
+            )
+
     def _fetch_conversation_row(
         self,
         connection: Connection,
@@ -409,7 +490,7 @@ class ConversationService:
         rows = connection.execute(
             text(
                 """
-                SELECT id, role, content, created_at, updated_at
+                SELECT id, role, content, rag_sources_json, created_at, updated_at
                 FROM conversation_messages
                 WHERE conversation_id = :conversation_id
                 ORDER BY position ASC, created_at ASC
@@ -423,6 +504,7 @@ class ConversationService:
                 id=str(row["id"]),
                 role=str(row["role"]),
                 content=str(row["content"]),
+                rag_sources=_parse_rag_sources(row["rag_sources_json"]),
                 created_at=_isoformat(row["created_at"]),
                 updated_at=_isoformat(row["updated_at"]),
             )
@@ -610,6 +692,7 @@ class ConversationService:
                             conversation_id,
                             role,
                             content,
+                            rag_sources_json,
                             position,
                             created_at,
                             updated_at
@@ -619,6 +702,7 @@ class ConversationService:
                             :conversation_id,
                             :role,
                             :content,
+                            :rag_sources_json,
                             :position,
                             :now,
                             :now
@@ -630,6 +714,7 @@ class ConversationService:
                         "conversation_id": normalized_id,
                         "role": message.role,
                         "content": message.content,
+                        "rag_sources_json": _serialize_rag_sources(message.rag_sources),
                         "position": position,
                         "now": now,
                     },
@@ -643,6 +728,7 @@ class ConversationService:
         user_id: int,
         query: str,
         ai_content: str,
+        rag_sources: Sequence[Mapping[str, object]],
         message_id: str | None,
         response_id: str | None,
     ) -> None:
@@ -706,6 +792,7 @@ class ConversationService:
                 message_id=_ensure_uuid(message_id),
                 role="user",
                 content=query,
+                rag_sources=[],
                 position=next_position,
                 now=now,
             )
@@ -715,6 +802,7 @@ class ConversationService:
                 message_id=_ensure_uuid(response_id),
                 role="ai",
                 content=ai_content,
+                rag_sources=rag_sources,
                 position=next_position + 1,
                 now=now,
             )
@@ -745,6 +833,7 @@ class ConversationService:
         message_id: str,
         role: str,
         content: str,
+        rag_sources: Sequence[Mapping[str, object]],
         position: int,
         now: datetime,
     ) -> None:
@@ -756,6 +845,7 @@ class ConversationService:
                     conversation_id,
                     role,
                     content,
+                    rag_sources_json,
                     position,
                     created_at,
                     updated_at
@@ -765,6 +855,7 @@ class ConversationService:
                     :conversation_id,
                     :role,
                     :content,
+                    :rag_sources_json,
                     :position,
                     :now,
                     :now
@@ -772,6 +863,7 @@ class ConversationService:
                 ON DUPLICATE KEY UPDATE
                     role = VALUES(role),
                     content = VALUES(content),
+                    rag_sources_json = VALUES(rag_sources_json),
                     updated_at = VALUES(updated_at)
                 """
             ),
@@ -780,6 +872,7 @@ class ConversationService:
                 "conversation_id": conversation_id,
                 "role": role,
                 "content": content,
+                "rag_sources_json": _serialize_rag_sources(rag_sources),
                 "position": position,
                 "now": now,
             },

@@ -87,6 +87,26 @@ class ModelConfigUpdateRequest(BaseModel):
     api_key: str | None = Field(None, max_length=512)
 
 
+class RagKnowledgeFileResponse(BaseModel):
+    name: str
+    size: int
+    modified_at: str
+    md5: str
+    indexed: bool
+    chunk_count: int
+
+
+class RagStatusResponse(BaseModel):
+    collection_name: str
+    data_path: str
+    persist_directory: str
+    allowed_file_types: list[str]
+    total_files: int
+    indexed_files: int
+    vector_count: int
+    files: list[RagKnowledgeFileResponse]
+
+
 class AdminDashboardResponse(BaseModel):
     total_users: int
     active_users: int

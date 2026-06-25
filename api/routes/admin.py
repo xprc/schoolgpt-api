@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy.exc import IntegrityError
 
 from api.core.security import TokenPayload, get_current_token_payload
@@ -13,6 +13,7 @@ from api.schemas.admin import (
     ModelConfigResponse,
     ModelConfigUpdateRequest,
     ModelProviderOptionResponse,
+    RagStatusResponse,
 )
 from api.services.conversation_service import (
     AdminConversationSummary,
@@ -31,6 +32,7 @@ from api.services.user_service import (
     UserService,
     get_user_service,
 )
+from rag.vector_store import get_vector_store_service
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -123,6 +125,10 @@ def _to_provider_option_response(
         api_path=option.api_path,
         models=list(option.models),
     )
+
+
+def _get_rag_status_response() -> RagStatusResponse:
+    return RagStatusResponse(**get_vector_store_service().get_status())
 
 
 @router.get("/dashboard", response_model=AdminDashboardResponse)
@@ -344,3 +350,70 @@ async def update_model_config(
         ) from exc
 
     return _to_model_config_response(model_config)
+
+
+@router.get("/rag", response_model=RagStatusResponse)
+async def get_rag_status(
+    _: User = Depends(require_admin_user),
+) -> RagStatusResponse:
+    return _get_rag_status_response()
+
+
+@router.post("/rag/files", response_model=RagStatusResponse)
+async def upload_rag_files(
+    files: list[UploadFile] = File(...),
+    _: User = Depends(require_admin_user),
+) -> RagStatusResponse:
+    if not files:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="请选择要上传的文件",
+        )
+
+    vector_store_service = get_vector_store_service()
+
+    for upload_file in files:
+        try:
+            target_path = vector_store_service.resolve_upload_target(upload_file.filename or "")
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+        with target_path.open("wb") as output_file:
+            while chunk := await upload_file.read(1024 * 1024):
+                output_file.write(chunk)
+
+        await upload_file.close()
+
+    return _get_rag_status_response()
+
+
+@router.delete("/rag/files/{file_name}", response_model=RagStatusResponse)
+async def delete_rag_file(
+    file_name: str,
+    _: User = Depends(require_admin_user),
+) -> RagStatusResponse:
+    try:
+        get_vector_store_service().delete_knowledge_file(file_name)
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    return _get_rag_status_response()
+
+
+@router.post("/rag/rebuild", response_model=RagStatusResponse)
+async def rebuild_rag_database(
+    _: User = Depends(require_admin_user),
+) -> RagStatusResponse:
+    get_vector_store_service().rebuild_database()
+    return _get_rag_status_response()

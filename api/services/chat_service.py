@@ -5,6 +5,7 @@ from functools import lru_cache
 
 from api.services.model_config_service import ModelConfigService, get_model_config_service
 from model.factory import ModelConfigurationError, create_webchat_model
+from rag.source_context import get_rag_sources, reset_rag_sources, restore_rag_sources
 
 
 class ChatService:
@@ -35,10 +36,28 @@ class ChatService:
         query: str,
         delay_seconds: float,
     ) -> AsyncIterator[str]:
-        async for char in self.stream_content(query, delay_seconds):
-            yield f"data: {json.dumps(char, ensure_ascii=False)}\n\n"
+        rag_token = reset_rag_sources()
+        try:
+            async for char in self.stream_content(query, delay_seconds):
+                yield f"data: {json.dumps(char, ensure_ascii=False)}\n\n"
 
-        yield "data: [DONE]\n\n"
+            rag_sources = get_rag_sources()
+            if rag_sources:
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "type": "rag_sources",
+                            "sources": rag_sources,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n\n"
+                )
+
+            yield "data: [DONE]\n\n"
+        finally:
+            restore_rag_sources(rag_token)
 
     async def stream_content(
         self,

@@ -42,6 +42,7 @@ def _to_message_response(message: ConversationMessage) -> ConversationMessageRes
         id=message.id,
         role=message.role,
         content=message.content,
+        rag_sources=message.rag_sources,
         created_at=message.created_at,
         updated_at=message.updated_at,
     )

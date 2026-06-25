@@ -19,6 +19,7 @@ class ChatMessagePayload(BaseModel):
     id: str = Field(..., min_length=1, max_length=64)
     role: ChatMessageRole
     content: str
+    rag_sources: list[dict[str, object]] = Field(default_factory=list)
 
 
 class ConversationUpsertRequest(BaseModel):
@@ -44,6 +45,7 @@ class ConversationMessageResponse(BaseModel):
     id: str
     role: ChatMessageRole
     content: str
+    rag_sources: list[dict[str, object]]
     created_at: str
     updated_at: str
 

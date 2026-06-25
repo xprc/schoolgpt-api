@@ -14,6 +14,7 @@ from api.services.conversation_service import (
 )
 from api.services.chat_service import ChatService, get_chat_service
 from model.factory import ModelConfigurationError
+from rag.source_context import get_rag_sources, reset_rag_sources, restore_rag_sources
 
 router = APIRouter(
     prefix="/chat",
@@ -57,22 +58,41 @@ async def stream_chat(
             ) from exc
 
     async def stream_events() -> AsyncIterator[str]:
+        rag_token = reset_rag_sources()
         ai_content = ""
-        async for char in service.stream_content(request.query, settings.stream_delay_seconds):
-            ai_content += char
-            yield f"data: {json.dumps(char, ensure_ascii=False)}\n\n"
+        try:
+            async for char in service.stream_content(request.query, settings.stream_delay_seconds):
+                ai_content += char
+                yield f"data: {json.dumps(char, ensure_ascii=False)}\n\n"
 
-        if request.conversation_id:
-            conversation_service.append_generated_exchange(
-                conversation_id=request.conversation_id,
-                user_id=token_payload.user_id,
-                query=request.query,
-                ai_content=ai_content,
-                message_id=request.message_id,
-                response_id=request.response_id,
-            )
+            rag_sources = get_rag_sources()
+            if rag_sources:
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "type": "rag_sources",
+                            "sources": rag_sources,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n\n"
+                )
 
-        yield "data: [DONE]\n\n"
+            if request.conversation_id:
+                conversation_service.append_generated_exchange(
+                    conversation_id=request.conversation_id,
+                    user_id=token_payload.user_id,
+                    query=request.query,
+                    ai_content=ai_content,
+                    rag_sources=rag_sources,
+                    message_id=request.message_id,
+                    response_id=request.response_id,
+                )
+
+            yield "data: [DONE]\n\n"
+        finally:
+            restore_rag_sources(rag_token)
 
     return StreamingResponse(
         stream_events(),
