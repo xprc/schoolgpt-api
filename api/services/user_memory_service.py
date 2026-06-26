@@ -1,0 +1,356 @@
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from functools import lru_cache
+from uuid import UUID, uuid4
+
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Connection
+from sqlalchemy.engine.url import make_url
+
+from api.core.settings import get_database_url
+from api.services.user_service import CREATE_USERS_SQL
+
+
+MAX_MEMORY_CONTENT_LENGTH = 4000
+DEFAULT_MEMORY_LIMIT = 50
+MAX_MEMORY_LIMIT = 100
+
+CREATE_USER_MEMORIES_SQL = """
+CREATE TABLE IF NOT EXISTS user_memories (
+    id CHAR(36) NOT NULL,
+    user_id BIGINT UNSIGNED NOT NULL,
+    content TEXT NOT NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (id),
+    KEY idx_user_memories_user_updated (user_id, updated_at),
+    CONSTRAINT fk_user_memories_user
+        FOREIGN KEY (user_id) REFERENCES users(id)
+        ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+"""
+
+
+@dataclass(frozen=True)
+class UserMemory:
+    id: str
+    user_id: int
+    content: str
+    created_at: str
+    updated_at: str
+
+
+def _quote_mysql_identifier(identifier: str) -> str:
+    return "`" + identifier.replace("`", "``") + "`"
+
+
+def _ensure_uuid(value: str | None) -> str:
+    if not value:
+        return str(uuid4())
+
+    return str(UUID(value))
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _isoformat(value: object) -> str:
+    if isinstance(value, datetime):
+        normalized = value
+    else:
+        normalized = _now_utc()
+
+    if normalized.tzinfo is None:
+        normalized = normalized.replace(tzinfo=timezone.utc)
+
+    return normalized.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _clean_content(content: str) -> str:
+    normalized_content = content.strip()
+    if not normalized_content:
+        raise ValueError("Memory content is required")
+    if len(normalized_content) > MAX_MEMORY_CONTENT_LENGTH:
+        raise ValueError("Memory content is too long")
+
+    return normalized_content
+
+
+def _normalize_limit(limit: int | None) -> int:
+    if limit is None:
+        return DEFAULT_MEMORY_LIMIT
+
+    return max(1, min(MAX_MEMORY_LIMIT, int(limit)))
+
+
+def _row_to_memory(row: Mapping[str, object]) -> UserMemory:
+    return UserMemory(
+        id=str(row["id"]),
+        user_id=int(row["user_id"]),
+        content=str(row["content"]),
+        created_at=_isoformat(row["created_at"]),
+        updated_at=_isoformat(row["updated_at"]),
+    )
+
+
+def _memory_match_score(memory: UserMemory, query: str) -> float:
+    normalized_query = " ".join(query.lower().split())
+    if not normalized_query:
+        return 0
+
+    content = " ".join(memory.content.lower().split())
+    if not content:
+        return 0
+
+    score = 0.0
+    if normalized_query in content:
+        score += 20
+    if content in normalized_query:
+        score += 8
+
+    terms = [term for term in normalized_query.split(" ") if len(term) > 1]
+    for term in terms:
+        if term in content:
+            score += 5
+
+    query_chars = {char for char in normalized_query if not char.isspace()}
+    content_chars = {char for char in content if not char.isspace()}
+    if query_chars:
+        score += len(query_chars & content_chars) / len(query_chars) * 3
+
+    return score
+
+
+class UserMemoryService:
+    def __init__(self) -> None:
+        database_url = get_database_url()
+        self._ensure_mysql_database(database_url)
+        self._engine = create_engine(
+            database_url,
+            pool_pre_ping=True,
+            pool_recycle=1800,
+            future=True,
+        )
+        self._initialize_database()
+
+    def _ensure_mysql_database(self, database_url: str) -> None:
+        url = make_url(database_url)
+        if not url.drivername.startswith("mysql") or not url.database:
+            return
+
+        server_engine = create_engine(
+            url.set(database=None),
+            pool_pre_ping=True,
+            future=True,
+        )
+
+        try:
+            with server_engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "CREATE DATABASE IF NOT EXISTS "
+                        f"{_quote_mysql_identifier(url.database)} "
+                        "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                    )
+                )
+        finally:
+            server_engine.dispose()
+
+    def _initialize_database(self) -> None:
+        with self._engine.begin() as connection:
+            connection.execute(text(CREATE_USERS_SQL))
+            connection.execute(text(CREATE_USER_MEMORIES_SQL))
+
+    def _get_memory_row(
+        self,
+        connection: Connection,
+        memory_id: str,
+        user_id: int,
+    ) -> Mapping[str, object] | None:
+        return connection.execute(
+            text(
+                """
+                SELECT id, user_id, content, created_at, updated_at
+                FROM user_memories
+                WHERE id = :memory_id AND user_id = :user_id
+                """
+            ),
+            {"memory_id": memory_id, "user_id": user_id},
+        ).mappings().fetchone()
+
+    def get_memory(self, user_id: int, memory_id: str) -> UserMemory | None:
+        normalized_id = _ensure_uuid(memory_id)
+        with self._engine.connect() as connection:
+            row = self._get_memory_row(connection, normalized_id, user_id)
+
+        if row is None:
+            return None
+
+        return _row_to_memory(row)
+
+    def list_memories(
+        self,
+        user_id: int,
+        query: str | None = None,
+        limit: int | None = None,
+        fallback_to_recent: bool = False,
+    ) -> list[UserMemory]:
+        normalized_limit = _normalize_limit(limit)
+        normalized_query = " ".join((query or "").split())
+        fetch_limit = max(normalized_limit, 500) if normalized_query else normalized_limit
+
+        with self._engine.connect() as connection:
+            rows = connection.execute(
+                text(
+                    """
+                    SELECT id, user_id, content, created_at, updated_at
+                    FROM user_memories
+                    WHERE user_id = :user_id
+                    ORDER BY updated_at DESC, created_at DESC
+                    LIMIT :limit
+                    """
+                ),
+                {"user_id": user_id, "limit": fetch_limit},
+            ).mappings().fetchall()
+
+        memories = [_row_to_memory(row) for row in rows]
+        if not normalized_query:
+            return memories[:normalized_limit]
+
+        scored_memories = [
+            (_memory_match_score(memory, normalized_query), index, memory)
+            for index, memory in enumerate(memories)
+        ]
+        positive_matches = [
+            (score, index, memory)
+            for score, index, memory in scored_memories
+            if score > 0
+        ]
+        if not positive_matches:
+            if fallback_to_recent:
+                return memories[:normalized_limit]
+
+            return []
+
+        positive_matches.sort(key=lambda item: (-item[0], item[1]))
+        return [memory for _, _, memory in positive_matches[:normalized_limit]]
+
+    def create_memory(self, user_id: int, content: str) -> UserMemory:
+        normalized_content = _clean_content(content)
+        now = _now_utc()
+
+        with self._engine.begin() as connection:
+            existing_row = connection.execute(
+                text(
+                    """
+                    SELECT id, user_id, content, created_at, updated_at
+                    FROM user_memories
+                    WHERE user_id = :user_id AND content = :content
+                    LIMIT 1
+                    """
+                ),
+                {"user_id": user_id, "content": normalized_content},
+            ).mappings().fetchone()
+            if existing_row is not None:
+                return _row_to_memory(existing_row)
+
+            memory_id = _ensure_uuid(None)
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO user_memories (
+                        id,
+                        user_id,
+                        content,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (
+                        :memory_id,
+                        :user_id,
+                        :content,
+                        :now,
+                        :now
+                    )
+                    """
+                ),
+                {
+                    "memory_id": memory_id,
+                    "user_id": user_id,
+                    "content": normalized_content,
+                    "now": now,
+                },
+            )
+
+        created_memory = self.get_memory(user_id, memory_id)
+        if created_memory is None:
+            raise RuntimeError("Memory creation failed")
+
+        return created_memory
+
+    def update_memory(
+        self,
+        user_id: int,
+        memory_id: str,
+        content: str,
+    ) -> UserMemory | None:
+        normalized_id = _ensure_uuid(memory_id)
+        normalized_content = _clean_content(content)
+        now = _now_utc()
+
+        with self._engine.begin() as connection:
+            result = connection.execute(
+                text(
+                    """
+                    UPDATE user_memories
+                    SET content = :content,
+                        updated_at = :now
+                    WHERE id = :memory_id AND user_id = :user_id
+                    """
+                ),
+                {
+                    "memory_id": normalized_id,
+                    "user_id": user_id,
+                    "content": normalized_content,
+                    "now": now,
+                },
+            )
+            if result.rowcount == 0:
+                return None
+
+        return self.get_memory(user_id, normalized_id)
+
+    def delete_memory(self, user_id: int, memory_id: str) -> bool:
+        normalized_id = _ensure_uuid(memory_id)
+        with self._engine.begin() as connection:
+            result = connection.execute(
+                text(
+                    """
+                    DELETE FROM user_memories
+                    WHERE id = :memory_id AND user_id = :user_id
+                    """
+                ),
+                {"memory_id": normalized_id, "user_id": user_id},
+            )
+
+        return result.rowcount > 0
+
+    def format_memories_for_agent(self, memories: Sequence[UserMemory]) -> str:
+        if not memories:
+            return "没有找到可用的用户记忆。"
+
+        lines = ["找到以下用户记忆："]
+        for index, memory in enumerate(memories, 1):
+            lines.append(
+                f"{index}. id={memory.id} | updated_at={memory.updated_at} | "
+                f"content={memory.content}"
+            )
+
+        return "\n".join(lines)
+
+
+@lru_cache(maxsize=1)
+def get_user_memory_service() -> UserMemoryService:
+    return UserMemoryService()

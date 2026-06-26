@@ -16,6 +16,7 @@ from api.services.model_config_service import (
     CREATE_MODEL_CONFIGS_SQL,
     MODEL_PROVIDER_DEFAULTS,
 )
+from api.services.user_memory_service import CREATE_USER_MEMORIES_SQL
 from api.services.user_service import (
     CREATE_USERS_SQL,
     _email_to_avatar_sha256,
@@ -85,6 +86,7 @@ def initialize_first_run(request: FirstRunSetupRequest) -> None:
             connection.execute(text(CREATE_CONVERSATIONS_SQL))
             connection.execute(text(CREATE_CONVERSATION_MESSAGES_SQL))
             connection.execute(text(CREATE_CONVERSATION_PERMISSIONS_SQL))
+            connection.execute(text(CREATE_USER_MEMORIES_SQL))
             connection.execute(text(CREATE_MODEL_CONFIGS_SQL))
 
             defaults = MODEL_PROVIDER_DEFAULTS["deepseek"]

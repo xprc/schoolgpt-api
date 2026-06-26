@@ -186,6 +186,7 @@ class ChatService:
         query: str,
         delay_seconds: float,
         enable_thinking: bool = True,
+        user_id: int | None = None,
     ) -> AsyncIterator[str]:
         rag_token = reset_rag_sources()
         try:
@@ -193,6 +194,7 @@ class ChatService:
                 [{"role": "user", "content": query}],
                 delay_seconds,
                 enable_thinking,
+                user_id,
             ):
                 payload: object = event["content"]
                 if event["type"] != "content":
@@ -223,11 +225,13 @@ class ChatService:
         messages: Sequence[Mapping[str, str]] | str,
         delay_seconds: float,
         enable_thinking: bool = True,
+        user_id: int | None = None,
     ) -> AsyncIterator[str]:
         async for event in self.stream_events(
             messages,
             delay_seconds,
             enable_thinking,
+            user_id,
         ):
             if event["type"] == "content":
                 yield event["content"]
@@ -237,9 +241,10 @@ class ChatService:
         messages: Sequence[Mapping[str, str]] | str,
         delay_seconds: float,
         enable_thinking: bool = True,
+        user_id: int | None = None,
     ) -> AsyncIterator[dict[str, str]]:
         agent = self._get_agent(enable_thinking)
-        chunks = agent.execute_stream(messages)
+        chunks = agent.execute_stream(messages, user_id=user_id)
         pending_reasoning_parts: list[str] = []
         saw_content = False
 

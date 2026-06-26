@@ -124,6 +124,7 @@ async def stream_chat(
                 context_messages,
                 settings.stream_delay_seconds,
                 request.enable_thinking,
+                token_payload.user_id,
             ):
                 event_type = event["type"]
                 content = event["content"]
