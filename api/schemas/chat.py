@@ -3,13 +3,6 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
-class ChatRequest(BaseModel):
-    query: str = Field(..., min_length=1)
-    conversation_id: str | None = None
-    message_id: str | None = None
-    response_id: str | None = None
-
-
 ChatMessageRole = Literal["user", "ai"]
 ConversationShareScope = Literal["private", "link_read", "link_write"]
 ConversationPermission = Literal["owner", "read", "write"]
@@ -20,6 +13,17 @@ class ChatMessagePayload(BaseModel):
     role: ChatMessageRole
     content: str
     rag_sources: list[dict[str, object]] = Field(default_factory=list)
+    reasoning_content: str | None = None
+    reasoning_duration_ms: int | None = Field(default=None, ge=0)
+
+
+class ChatRequest(BaseModel):
+    query: str = Field(..., min_length=1)
+    conversation_id: str | None = None
+    message_id: str | None = None
+    response_id: str | None = None
+    messages: list[ChatMessagePayload] = Field(default_factory=list)
+    enable_thinking: bool = True
 
 
 class ConversationUpsertRequest(BaseModel):
@@ -46,6 +50,8 @@ class ConversationMessageResponse(BaseModel):
     role: ChatMessageRole
     content: str
     rag_sources: list[dict[str, object]]
+    reasoning_content: str | None = None
+    reasoning_duration_ms: int | None = None
     created_at: str
     updated_at: str
 

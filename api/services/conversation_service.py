@@ -47,6 +47,8 @@ CREATE TABLE IF NOT EXISTS conversation_messages (
     role VARCHAR(16) NOT NULL,
     content MEDIUMTEXT NOT NULL,
     rag_sources_json JSON NULL,
+    reasoning_content MEDIUMTEXT NULL,
+    reasoning_duration_ms INT UNSIGNED NULL,
     position INT UNSIGNED NOT NULL,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
@@ -80,16 +82,6 @@ CREATE TABLE IF NOT EXISTS conversation_permissions (
 VALID_SHARE_SCOPES = {"private", "link_read", "link_write"}
 VALID_PERMISSIONS = {"read", "write"}
 DEFAULT_TITLE = "新对话"
-CONVERSATION_MANAGEMENT_COLUMNS = (
-    ("is_pinned", "BOOLEAN NOT NULL DEFAULT FALSE AFTER share_scope"),
-    ("pinned_at", "DATETIME(6) NULL AFTER is_pinned"),
-    ("is_visible", "BOOLEAN NOT NULL DEFAULT TRUE AFTER pinned_at"),
-)
-CONVERSATION_MESSAGE_COLUMNS = (
-    ("rag_sources_json", "JSON NULL AFTER content"),
-)
-
-
 class ConversationNotFoundError(Exception):
     pass
 
@@ -104,6 +96,8 @@ class ConversationMessage:
     role: str
     content: str
     rag_sources: list[dict[str, object]]
+    reasoning_content: str | None
+    reasoning_duration_ms: int | None
     created_at: str
     updated_at: str
 
@@ -240,6 +234,14 @@ def _normalize_permission(permission: object) -> str | None:
     return None
 
 
+def _escape_like(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+
+
 def _resolve_access(row: Mapping[str, object], user_id: int) -> ConversationAccess:
     if int(row["owner_user_id"]) == user_id:
         return ConversationAccess(permission="owner", can_write=True)
@@ -320,6 +322,31 @@ def _parse_rag_sources(value: object) -> list[dict[str, object]]:
     )
 
 
+def _normalize_reasoning_content(value: object) -> str | None:
+    if value is None:
+        return None
+
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="ignore")
+
+    if not isinstance(value, str):
+        return None
+
+    return value if value.strip() else None
+
+
+def _normalize_reasoning_duration_ms(value: object) -> int | None:
+    if value is None:
+        return None
+
+    try:
+        duration_ms = int(value)
+    except (TypeError, ValueError):
+        return None
+
+    return max(0, duration_ms)
+
+
 class ConversationService:
     def __init__(self) -> None:
         database_url = get_database_url()
@@ -361,96 +388,6 @@ class ConversationService:
             connection.execute(text(CREATE_CONVERSATIONS_SQL))
             connection.execute(text(CREATE_CONVERSATION_MESSAGES_SQL))
             connection.execute(text(CREATE_CONVERSATION_PERMISSIONS_SQL))
-            self._ensure_conversation_management_columns(connection)
-            self._ensure_conversation_message_columns(connection)
-
-    def _mysql_column_exists(
-        self,
-        connection: Connection,
-        table_name: str,
-        column_name: str,
-    ) -> bool:
-        count = connection.execute(
-            text(
-                """
-                SELECT COUNT(*)
-                FROM INFORMATION_SCHEMA.COLUMNS
-                WHERE TABLE_SCHEMA = DATABASE()
-                    AND TABLE_NAME = :table_name
-                    AND COLUMN_NAME = :column_name
-                """
-            ),
-            {"table_name": table_name, "column_name": column_name},
-        ).scalar_one()
-
-        return int(count) > 0
-
-    def _mysql_index_exists(
-        self,
-        connection: Connection,
-        table_name: str,
-        index_name: str,
-    ) -> bool:
-        count = connection.execute(
-            text(
-                """
-                SELECT COUNT(*)
-                FROM INFORMATION_SCHEMA.STATISTICS
-                WHERE TABLE_SCHEMA = DATABASE()
-                    AND TABLE_NAME = :table_name
-                    AND INDEX_NAME = :index_name
-                """
-            ),
-            {"table_name": table_name, "index_name": index_name},
-        ).scalar_one()
-
-        return int(count) > 0
-
-    def _ensure_conversation_management_columns(self, connection: Connection) -> None:
-        for column_name, column_definition in CONVERSATION_MANAGEMENT_COLUMNS:
-            if self._mysql_column_exists(connection, "conversations", column_name):
-                continue
-
-            connection.execute(
-                text(
-                    "ALTER TABLE conversations "
-                    f"ADD COLUMN {column_name} {column_definition}"
-                )
-            )
-
-        if self._mysql_index_exists(
-            connection,
-            "conversations",
-            "idx_conversations_owner_visible_pinned",
-        ):
-            return
-
-        connection.execute(
-            text(
-                """
-                ALTER TABLE conversations
-                ADD KEY idx_conversations_owner_visible_pinned (
-                    owner_user_id,
-                    is_visible,
-                    is_pinned,
-                    pinned_at,
-                    updated_at
-                )
-                """
-            )
-        )
-
-    def _ensure_conversation_message_columns(self, connection: Connection) -> None:
-        for column_name, column_definition in CONVERSATION_MESSAGE_COLUMNS:
-            if self._mysql_column_exists(connection, "conversation_messages", column_name):
-                continue
-
-            connection.execute(
-                text(
-                    "ALTER TABLE conversation_messages "
-                    f"ADD COLUMN {column_name} {column_definition}"
-                )
-            )
 
     def _fetch_conversation_row(
         self,
@@ -490,7 +427,15 @@ class ConversationService:
         rows = connection.execute(
             text(
                 """
-                SELECT id, role, content, rag_sources_json, created_at, updated_at
+                SELECT
+                    id,
+                    role,
+                    content,
+                    rag_sources_json,
+                    reasoning_content,
+                    reasoning_duration_ms,
+                    created_at,
+                    updated_at
                 FROM conversation_messages
                 WHERE conversation_id = :conversation_id
                 ORDER BY position ASC, created_at ASC
@@ -505,6 +450,12 @@ class ConversationService:
                 role=str(row["role"]),
                 content=str(row["content"]),
                 rag_sources=_parse_rag_sources(row["rag_sources_json"]),
+                reasoning_content=_normalize_reasoning_content(
+                    row["reasoning_content"],
+                ),
+                reasoning_duration_ms=_normalize_reasoning_duration_ms(
+                    row["reasoning_duration_ms"],
+                ),
                 created_at=_isoformat(row["created_at"]),
                 updated_at=_isoformat(row["updated_at"]),
             )
@@ -533,7 +484,15 @@ class ConversationService:
             messages=self._read_messages(connection, conversation_id),
         )
 
-    def list_conversations(self, user_id: int) -> list[ConversationSummary]:
+    def list_conversations(
+        self,
+        user_id: int,
+        search_query: str | None = None,
+    ) -> list[ConversationSummary]:
+        normalized_query = " ".join((search_query or "").split())
+        has_query = bool(normalized_query)
+        query_like = f"%{_escape_like(normalized_query)}%" if has_query else "%"
+
         with self._engine.connect() as connection:
             rows = connection.execute(
                 text(
@@ -555,7 +514,23 @@ class ConversationService:
                         AND cp.user_id = :user_id
                     WHERE c.is_visible = TRUE
                         AND (c.owner_user_id = :user_id OR cp.user_id = :user_id)
+                        AND (
+                            :has_query = FALSE
+                            OR c.title LIKE :query_like ESCAPE '\\\\'
+                            OR EXISTS (
+                                SELECT 1
+                                FROM conversation_messages cm
+                                WHERE cm.conversation_id = c.id
+                                    AND cm.content LIKE :query_like ESCAPE '\\\\'
+                                LIMIT 1
+                            )
+                        )
                     ORDER BY
+                        CASE
+                            WHEN :has_query = FALSE THEN 0
+                            WHEN c.title LIKE :query_like ESCAPE '\\\\' THEN 0
+                            ELSE 1
+                        END ASC,
                         c.is_pinned DESC,
                         CASE
                             WHEN c.is_pinned THEN COALESCE(c.pinned_at, c.updated_at)
@@ -564,7 +539,11 @@ class ConversationService:
                     LIMIT 100
                     """
                 ),
-                {"user_id": user_id},
+                {
+                    "user_id": user_id,
+                    "has_query": has_query,
+                    "query_like": query_like,
+                },
             ).mappings().fetchall()
 
         summaries: list[ConversationSummary] = []
@@ -596,6 +575,22 @@ class ConversationService:
 
             access = _resolve_access(row, user_id)
             return self._to_conversation_data(connection, row, access)
+
+    def conversation_exists(self, conversation_id: str) -> bool:
+        normalized_id = _ensure_uuid(conversation_id)
+        with self._engine.connect() as connection:
+            count = connection.execute(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM conversations
+                    WHERE id = :conversation_id
+                    """
+                ),
+                {"conversation_id": normalized_id},
+            ).scalar_one()
+
+        return int(count) > 0
 
     def save_conversation(
         self,
@@ -693,6 +688,8 @@ class ConversationService:
                             role,
                             content,
                             rag_sources_json,
+                            reasoning_content,
+                            reasoning_duration_ms,
                             position,
                             created_at,
                             updated_at
@@ -703,6 +700,8 @@ class ConversationService:
                             :role,
                             :content,
                             :rag_sources_json,
+                            :reasoning_content,
+                            :reasoning_duration_ms,
                             :position,
                             :now,
                             :now
@@ -715,6 +714,12 @@ class ConversationService:
                         "role": message.role,
                         "content": message.content,
                         "rag_sources_json": _serialize_rag_sources(message.rag_sources),
+                        "reasoning_content": _normalize_reasoning_content(
+                            message.reasoning_content,
+                        ),
+                        "reasoning_duration_ms": _normalize_reasoning_duration_ms(
+                            message.reasoning_duration_ms,
+                        ),
                         "position": position,
                         "now": now,
                     },
@@ -729,6 +734,8 @@ class ConversationService:
         query: str,
         ai_content: str,
         rag_sources: Sequence[Mapping[str, object]],
+        reasoning_content: str | None,
+        reasoning_duration_ms: int | None,
         message_id: str | None,
         response_id: str | None,
     ) -> None:
@@ -793,6 +800,8 @@ class ConversationService:
                 role="user",
                 content=query,
                 rag_sources=[],
+                reasoning_content=None,
+                reasoning_duration_ms=None,
                 position=next_position,
                 now=now,
             )
@@ -803,6 +812,8 @@ class ConversationService:
                 role="ai",
                 content=ai_content,
                 rag_sources=rag_sources,
+                reasoning_content=reasoning_content,
+                reasoning_duration_ms=reasoning_duration_ms,
                 position=next_position + 1,
                 now=now,
             )
@@ -834,6 +845,8 @@ class ConversationService:
         role: str,
         content: str,
         rag_sources: Sequence[Mapping[str, object]],
+        reasoning_content: str | None,
+        reasoning_duration_ms: int | None,
         position: int,
         now: datetime,
     ) -> None:
@@ -846,6 +859,8 @@ class ConversationService:
                     role,
                     content,
                     rag_sources_json,
+                    reasoning_content,
+                    reasoning_duration_ms,
                     position,
                     created_at,
                     updated_at
@@ -856,6 +871,8 @@ class ConversationService:
                     :role,
                     :content,
                     :rag_sources_json,
+                    :reasoning_content,
+                    :reasoning_duration_ms,
                     :position,
                     :now,
                     :now
@@ -864,6 +881,8 @@ class ConversationService:
                     role = VALUES(role),
                     content = VALUES(content),
                     rag_sources_json = VALUES(rag_sources_json),
+                    reasoning_content = VALUES(reasoning_content),
+                    reasoning_duration_ms = VALUES(reasoning_duration_ms),
                     updated_at = VALUES(updated_at)
                 """
             ),
@@ -873,6 +892,10 @@ class ConversationService:
                 "role": role,
                 "content": content,
                 "rag_sources_json": _serialize_rag_sources(rag_sources),
+                "reasoning_content": _normalize_reasoning_content(reasoning_content),
+                "reasoning_duration_ms": _normalize_reasoning_duration_ms(
+                    reasoning_duration_ms,
+                ),
                 "position": position,
                 "now": now,
             },

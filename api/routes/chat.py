@@ -1,5 +1,6 @@
 import json
 from collections.abc import AsyncIterator
+from time import perf_counter
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
@@ -22,6 +23,53 @@ router = APIRouter(
 )
 
 
+MAX_CONTEXT_MESSAGES = 40
+
+
+def _to_model_role(role: str) -> str:
+    return "assistant" if role == "ai" else "user"
+
+
+def _build_context_messages(
+    request: ChatRequest,
+    conversation_messages: list[object],
+) -> list[dict[str, str]]:
+    source_messages = request.messages or conversation_messages
+    context_messages: list[dict[str, str]] = []
+
+    for message in source_messages:
+        role = getattr(message, "role", None)
+        content = getattr(message, "content", None)
+        if role not in {"user", "ai"} or not isinstance(content, str):
+            continue
+
+        normalized_content = content.strip()
+        if not normalized_content:
+            continue
+
+        context_messages.append(
+            {
+                "role": _to_model_role(role),
+                "content": normalized_content,
+            }
+        )
+
+    query = request.query.strip()
+    if (
+        not context_messages
+        or context_messages[-1]["role"] != "user"
+        or context_messages[-1]["content"] != query
+    ):
+        context_messages.append(
+            {
+                "role": "user",
+                "content": query,
+            }
+        )
+
+    return context_messages[-MAX_CONTEXT_MESSAGES:]
+
+
 @router.post("")
 async def stream_chat(
     request: ChatRequest,
@@ -38,6 +86,7 @@ async def stream_chat(
             detail=str(exc),
         ) from exc
 
+    conversation_messages: list[object] = []
     if request.conversation_id:
         try:
             conversation = conversation_service.get_conversation(
@@ -49,21 +98,81 @@ async def stream_chat(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="没有权限修改该对话",
                 )
-        except ConversationNotFoundError:
-            pass
+            conversation_messages = list(conversation.messages)
+        except ConversationNotFoundError as exc:
+            if conversation_service.conversation_exists(request.conversation_id):
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="对话不存在或无权访问",
+                ) from exc
         except ValueError as exc:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="对话不存在或无权访问",
             ) from exc
 
+    context_messages = _build_context_messages(request, conversation_messages)
+
     async def stream_events() -> AsyncIterator[str]:
         rag_token = reset_rag_sources()
         ai_content = ""
+        reasoning_content = ""
+        reasoning_duration_ms: int | None = None
+        request_started_at = perf_counter()
         try:
-            async for char in service.stream_content(request.query, settings.stream_delay_seconds):
-                ai_content += char
-                yield f"data: {json.dumps(char, ensure_ascii=False)}\n\n"
+            async for event in service.stream_events(
+                context_messages,
+                settings.stream_delay_seconds,
+                request.enable_thinking,
+            ):
+                event_type = event["type"]
+                content = event["content"]
+
+                if event_type == "reasoning":
+                    reasoning_content += content
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "type": "reasoning",
+                                "content": content,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n\n"
+                    )
+                    continue
+
+                if reasoning_content and reasoning_duration_ms is None:
+                    reasoning_duration_ms = int((perf_counter() - request_started_at) * 1000)
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "type": "reasoning_done",
+                                "duration_ms": reasoning_duration_ms,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n\n"
+                    )
+
+                ai_content += content
+                yield f"data: {json.dumps(content, ensure_ascii=False)}\n\n"
+
+            if reasoning_content and reasoning_duration_ms is None:
+                reasoning_duration_ms = int((perf_counter() - request_started_at) * 1000)
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "type": "reasoning_done",
+                            "duration_ms": reasoning_duration_ms,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n\n"
+                )
 
             rag_sources = get_rag_sources()
             if rag_sources:
@@ -86,6 +195,8 @@ async def stream_chat(
                     query=request.query,
                     ai_content=ai_content,
                     rag_sources=rag_sources,
+                    reasoning_content=reasoning_content or None,
+                    reasoning_duration_ms=reasoning_duration_ms,
                     message_id=request.message_id,
                     response_id=request.response_id,
                 )

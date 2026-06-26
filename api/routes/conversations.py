@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from api.core.security import TokenPayload, get_current_token_payload
 from api.schemas.chat import (
@@ -43,6 +43,8 @@ def _to_message_response(message: ConversationMessage) -> ConversationMessageRes
         role=message.role,
         content=message.content,
         rag_sources=message.rag_sources,
+        reasoning_content=message.reasoning_content,
+        reasoning_duration_ms=message.reasoning_duration_ms,
         created_at=message.created_at,
         updated_at=message.updated_at,
     )
@@ -82,12 +84,13 @@ def _to_summary_response(summary: ConversationSummary) -> ConversationSummaryRes
 
 @router.get("", response_model=list[ConversationSummaryResponse])
 async def list_conversations(
+    query: str | None = Query(default=None, max_length=100),
     token_payload: TokenPayload = Depends(get_current_token_payload),
     service: ConversationService = Depends(get_conversation_service),
 ) -> list[ConversationSummaryResponse]:
     return [
         _to_summary_response(summary)
-        for summary in service.list_conversations(token_payload.user_id)
+        for summary in service.list_conversations(token_payload.user_id, query)
     ]
 
 

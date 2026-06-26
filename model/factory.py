@@ -19,20 +19,50 @@ class BaseModelFactory(ABC):
         pass
 
 
+def _thinking_extra_body(
+    model_config: ModelConfig,
+    enable_thinking: bool,
+) -> dict[str, object] | None:
+    if model_config.provider == "qwen":
+        return {"enable_thinking": enable_thinking}
+
+    if (
+        model_config.provider == "deepseek"
+        and model_config.model_name.lower().startswith("deepseek-v4")
+    ):
+        return {
+            "thinking": {
+                "type": "enabled" if enable_thinking else "disabled",
+            },
+        }
+
+    return None
+
+
 class webChatModelFactory(BaseModelFactory):
-    def __init__(self, model_config: ModelConfig | None = None) -> None:
+    def __init__(
+        self,
+        model_config: ModelConfig | None = None,
+        enable_thinking: bool = True,
+    ) -> None:
         self._model_config = model_config
+        self._enable_thinking = enable_thinking
 
     def generator(self):
         model_config = self._model_config or get_model_config_service().get_active_model_config()
         if not model_config.api_key.strip():
             raise ModelConfigurationError("请先在管理员中心配置模型 API Key")
 
-        return ChatOpenAI(
-            model_name=model_config.model_name,
-            base_url=model_config.base_url,
-            api_key=model_config.api_key,
-        )
+        model_kwargs = {
+            "model_name": model_config.model_name,
+            "base_url": model_config.base_url,
+            "api_key": model_config.api_key,
+        }
+        extra_body = _thinking_extra_body(model_config, self._enable_thinking)
+        if extra_body is not None:
+            model_kwargs["extra_body"] = extra_body
+
+        return ChatOpenAI(**model_kwargs)
 
 class bendiChatModelFactory(BaseModelFactory):
     def generator(self):
@@ -53,8 +83,11 @@ class EmbeddingsFactory(BaseModelFactory):
             query_instruction="为这个句子生成表示以用于检索相关文章："
         )
 
-def create_webchat_model(model_config: ModelConfig | None = None):
-    return webChatModelFactory(model_config).generator()
+def create_webchat_model(
+    model_config: ModelConfig | None = None,
+    enable_thinking: bool = True,
+):
+    return webChatModelFactory(model_config, enable_thinking).generator()
 
 
 embedding_model=EmbeddingsFactory().generator()
