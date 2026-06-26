@@ -233,12 +233,8 @@ class ChatService:
         delay_seconds: float,
         enable_thinking: bool = True,
     ) -> AsyncIterator[dict[str, str]]:
-        model_config = self._get_active_model_config()
-        if model_config.provider == "deepseek" and enable_thinking:
-            chunks = self._stream_deepseek_events(model_config, messages)
-        else:
-            agent = self._get_agent(enable_thinking)
-            chunks = agent.execute_stream(messages)
+        agent = self._get_agent(enable_thinking)
+        chunks = agent.execute_stream(messages)
 
         for chunk in chunks:
             if isinstance(chunk, str):
