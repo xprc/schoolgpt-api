@@ -79,7 +79,7 @@ async def stream_chat(
     settings: Settings = Depends(get_settings),
 ) -> StreamingResponse:
     try:
-        service.ensure_ready()
+        service.ensure_ready(request.enable_thinking)
     except ModelConfigurationError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

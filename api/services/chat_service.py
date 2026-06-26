@@ -35,17 +35,22 @@ class ChatService:
 
         agent_cache_key = f"{model_config.cache_key}:thinking={enable_thinking}"
         if agent_cache_key not in self._agents:
-            self._agents[agent_cache_key] = self._agent_class(
-                create_webchat_model(
-                    model_config,
-                    enable_thinking=enable_thinking,
+            try:
+                self._agents[agent_cache_key] = self._agent_class(
+                    create_webchat_model(
+                        model_config,
+                        enable_thinking=enable_thinking,
+                    )
                 )
-            )
+            except ModelConfigurationError:
+                raise
+            except Exception as exc:
+                raise ModelConfigurationError(f"模型初始化失败: {exc}") from exc
 
         return self._agents[agent_cache_key]
 
-    def ensure_ready(self) -> None:
-        self._get_active_model_config()
+    def ensure_ready(self, enable_thinking: bool = True) -> None:
+        self._get_agent(enable_thinking)
 
     @staticmethod
     def _message_text(messages: Sequence[Mapping[str, str]] | str) -> str:
@@ -235,6 +240,28 @@ class ChatService:
     ) -> AsyncIterator[dict[str, str]]:
         agent = self._get_agent(enable_thinking)
         chunks = agent.execute_stream(messages)
+        pending_reasoning_parts: list[str] = []
+        saw_content = False
+
+        async def emit_text(event_type: str, text: str) -> AsyncIterator[dict[str, str]]:
+            for char in text:
+                if delay_seconds > 0:
+                    await asyncio.sleep(delay_seconds)
+                yield {
+                    "type": event_type,
+                    "content": char,
+                }
+
+        async def flush_pending_reasoning(
+            event_type: str,
+        ) -> AsyncIterator[dict[str, str]]:
+            if not pending_reasoning_parts:
+                return
+
+            pending_text = "".join(pending_reasoning_parts)
+            pending_reasoning_parts.clear()
+            async for event in emit_text(event_type, pending_text):
+                yield event
 
         for chunk in chunks:
             if isinstance(chunk, str):
@@ -247,13 +274,29 @@ class ChatService:
             if event_type not in {"content", "reasoning"} or not content:
                 continue
 
-            for char in content:
-                if delay_seconds > 0:
-                    await asyncio.sleep(delay_seconds)
-                yield {
-                    "type": event_type,
-                    "content": char,
-                }
+            if event_type == "reasoning":
+                is_agent_trace = content.startswith("[Agent]")
+                if is_agent_trace:
+                    async for event in flush_pending_reasoning("reasoning"):
+                        yield event
+                    async for event in emit_text("reasoning", content):
+                        yield event
+                elif saw_content:
+                    async for event in emit_text("reasoning", content):
+                        yield event
+                else:
+                    pending_reasoning_parts.append(content)
+                continue
+
+            async for event in flush_pending_reasoning("reasoning"):
+                yield event
+            saw_content = True
+            async for event in emit_text("content", content):
+                yield event
+
+        if pending_reasoning_parts:
+            async for event in flush_pending_reasoning("content"):
+                yield event
 
 
 @lru_cache(maxsize=1)
