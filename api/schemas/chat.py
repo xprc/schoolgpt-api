@@ -15,6 +15,8 @@ class ChatMessagePayload(BaseModel):
     rag_sources: list[dict[str, object]] = Field(default_factory=list)
     reasoning_content: str | None = None
     reasoning_duration_ms: int | None = Field(default=None, ge=0)
+    created_at: str | None = None
+    updated_at: str | None = None
 
 
 class ChatRequest(BaseModel):

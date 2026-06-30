@@ -15,6 +15,25 @@ from api.services.user_service import CREATE_USERS_SQL
 MAX_MEMORY_CONTENT_LENGTH = 4000
 DEFAULT_MEMORY_LIMIT = 50
 MAX_MEMORY_LIMIT = 100
+DEFAULT_IDENTITY_MEMORY_PREFIX = "[默认记忆] 用户身份："
+DEFAULT_IDENTITY_MEMORY_CONTENT: dict[str, str] = {
+    "student": (
+        f"{DEFAULT_IDENTITY_MEMORY_PREFIX}学生。回答校园问题时优先关注选课、"
+        "学籍、奖助、考试、宿舍、办事流程等学生视角。"
+    ),
+    "teacher": (
+        f"{DEFAULT_IDENTITY_MEMORY_PREFIX}老师。回答校园问题时优先关注教学管理、"
+        "课程安排、学生指导、教务流程等教师视角。"
+    ),
+    "maintenance": (
+        f"{DEFAULT_IDENTITY_MEMORY_PREFIX}运维人员。回答校园问题时优先关注系统维护、"
+        "服务保障、故障处理和后勤流程等运维视角。"
+    ),
+    "admin": (
+        f"{DEFAULT_IDENTITY_MEMORY_PREFIX}管理员。回答校园问题时优先关注管理配置、"
+        "数据权限、系统运营和校内事务协调。"
+    ),
+}
 
 CREATE_USER_MEMORIES_SQL = """
 CREATE TABLE IF NOT EXISTS user_memories (
@@ -289,6 +308,99 @@ class UserMemoryService:
             raise RuntimeError("Memory creation failed")
 
         return created_memory
+
+    def ensure_default_identity_memory(
+        self,
+        user_id: int,
+        user_type: str,
+    ) -> UserMemory:
+        normalized_user_type = user_type.strip().lower()
+        content = DEFAULT_IDENTITY_MEMORY_CONTENT.get(
+            normalized_user_type,
+            DEFAULT_IDENTITY_MEMORY_CONTENT["student"],
+        )
+        now = _now_utc()
+
+        with self._engine.begin() as connection:
+            existing_row = connection.execute(
+                text(
+                    """
+                    SELECT id, user_id, content, created_at, updated_at
+                    FROM user_memories
+                    WHERE user_id = :user_id
+                        AND (
+                            content = :content
+                            OR content LIKE :prefix_like
+                        )
+                    ORDER BY updated_at DESC, created_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {
+                    "user_id": user_id,
+                    "content": content,
+                    "prefix_like": f"{DEFAULT_IDENTITY_MEMORY_PREFIX}%",
+                },
+            ).mappings().fetchone()
+
+            if existing_row is not None:
+                memory_id = str(existing_row["id"])
+                if str(existing_row["content"]) != content:
+                    connection.execute(
+                        text(
+                            """
+                            UPDATE user_memories
+                            SET content = :content,
+                                updated_at = :now
+                            WHERE id = :memory_id AND user_id = :user_id
+                            """
+                        ),
+                        {
+                            "memory_id": memory_id,
+                            "user_id": user_id,
+                            "content": content,
+                            "now": now,
+                        },
+                    )
+                memory_row = self._get_memory_row(connection, memory_id, user_id)
+                if memory_row is None:
+                    raise RuntimeError("Default identity memory update failed")
+
+                return _row_to_memory(memory_row)
+
+            memory_id = _ensure_uuid(None)
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO user_memories (
+                        id,
+                        user_id,
+                        content,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (
+                        :memory_id,
+                        :user_id,
+                        :content,
+                        :now,
+                        :now
+                    )
+                    """
+                ),
+                {
+                    "memory_id": memory_id,
+                    "user_id": user_id,
+                    "content": content,
+                    "now": now,
+                },
+            )
+
+        memory = self.get_memory(user_id, memory_id)
+        if memory is None:
+            raise RuntimeError("Default identity memory creation failed")
+
+        return memory
 
     def update_memory(
         self,

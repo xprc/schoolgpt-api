@@ -4,6 +4,7 @@ from langchain_core.tools import tool
 
 from agent.tools.user_context import get_current_agent_user_id
 from api.services.user_memory_service import get_user_memory_service
+from api.services.user_service import get_user_service
 from rag.rag_service import PolicyRagSearchService
 
 
@@ -39,6 +40,10 @@ def user_memory(
         return "当前会话没有可用的用户身份，无法读取或保存用户记忆。"
 
     memory_service = get_user_memory_service()
+    user = get_user_service().get_user_by_id(user_id)
+    if user is not None and user.is_active:
+        memory_service.ensure_default_identity_memory(user_id, user.user_type)
+
     normalized_action = str(action or "").strip().lower()
 
     if normalized_action in {"list", "search", "read"}:

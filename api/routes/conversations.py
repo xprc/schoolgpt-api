@@ -216,3 +216,24 @@ async def update_conversation_share(
         raise _not_found_exception() from exc
 
     return _to_conversation_response(conversation)
+
+
+@router.post("/{conversation_id}/share/continue", response_model=ConversationResponse)
+async def continue_shared_conversation(
+    conversation_id: str,
+    token_payload: TokenPayload = Depends(get_current_token_payload),
+    service: ConversationService = Depends(get_conversation_service),
+) -> ConversationResponse:
+    try:
+        conversation = service.continue_shared_conversation(
+            conversation_id=conversation_id,
+            user_id=token_payload.user_id,
+        )
+    except ConversationNotFoundError as exc:
+        raise _not_found_exception() from exc
+    except ConversationPermissionError as exc:
+        raise _permission_exception() from exc
+    except ValueError as exc:
+        raise _not_found_exception() from exc
+
+    return _to_conversation_response(conversation)

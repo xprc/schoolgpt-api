@@ -193,6 +193,27 @@ def _isoformat_optional(value: object) -> str | None:
     return _isoformat(value)
 
 
+def _parse_client_datetime(value: str | None, fallback: datetime) -> datetime:
+    if not value:
+        return fallback
+
+    normalized_value = value.strip()
+    if not normalized_value:
+        return fallback
+
+    try:
+        if normalized_value.endswith("Z"):
+            normalized_value = normalized_value[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(normalized_value)
+    except ValueError:
+        return fallback
+
+    if parsed.tzinfo is None:
+        return parsed
+
+    return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 def _as_bool(value: object) -> bool:
     if isinstance(value, bool):
         return value
@@ -254,7 +275,7 @@ def _resolve_access(row: Mapping[str, object], user_id: int) -> ConversationAcce
 
     share_scope = str(row["share_scope"])
     if share_scope == "link_write":
-        return ConversationAccess(permission="write", can_write=True)
+        return ConversationAccess(permission="read", can_write=False)
     if share_scope == "link_read":
         return ConversationAccess(permission="read", can_write=False)
 
@@ -679,6 +700,8 @@ class ConversationService:
             )
 
             for position, message in enumerate(messages):
+                message_created_at = _parse_client_datetime(message.created_at, now)
+                message_updated_at = _parse_client_datetime(message.updated_at, now)
                 connection.execute(
                     text(
                         """
@@ -703,8 +726,8 @@ class ConversationService:
                             :reasoning_content,
                             :reasoning_duration_ms,
                             :position,
-                            :now,
-                            :now
+                            :created_at,
+                            :updated_at
                         )
                         """
                     ),
@@ -721,7 +744,8 @@ class ConversationService:
                             message.reasoning_duration_ms,
                         ),
                         "position": position,
-                        "now": now,
+                        "created_at": message_created_at,
+                        "updated_at": message_updated_at,
                     },
                 )
 
@@ -937,6 +961,70 @@ class ConversationService:
             )
 
         return self.get_conversation(normalized_id, user_id)
+
+    def continue_shared_conversation(
+        self,
+        conversation_id: str,
+        user_id: int,
+    ) -> ConversationData:
+        normalized_id = _ensure_uuid(conversation_id)
+        new_conversation_id = str(uuid4())
+        now = _now_utc()
+
+        with self._engine.begin() as connection:
+            row = self._fetch_conversation_row(connection, normalized_id, user_id)
+            if row is None or not _as_bool(row["is_visible"]):
+                raise ConversationNotFoundError()
+
+            is_owner = int(row["owner_user_id"]) == user_id
+            if not is_owner and str(row["share_scope"]) != "link_write":
+                raise ConversationPermissionError()
+
+            messages = self._read_messages(connection, normalized_id)
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO conversations (
+                        id,
+                        owner_user_id,
+                        title,
+                        share_scope,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (
+                        :conversation_id,
+                        :user_id,
+                        :title,
+                        'private',
+                        :now,
+                        :now
+                    )
+                    """
+                ),
+                {
+                    "conversation_id": new_conversation_id,
+                    "user_id": user_id,
+                    "title": _clean_title(str(row["title"])),
+                    "now": now,
+                },
+            )
+
+            for position, message in enumerate(messages):
+                self._upsert_message(
+                    connection,
+                    conversation_id=new_conversation_id,
+                    message_id=str(uuid4()),
+                    role=message.role,
+                    content=message.content,
+                    rag_sources=message.rag_sources,
+                    reasoning_content=message.reasoning_content,
+                    reasoning_duration_ms=message.reasoning_duration_ms,
+                    position=position,
+                    now=now,
+                )
+
+        return self.get_conversation(new_conversation_id, user_id)
 
     def rename_conversation(
         self,

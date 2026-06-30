@@ -21,6 +21,9 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash VARCHAR(255) NOT NULL,
     display_name VARCHAR(120) NOT NULL,
     user_type VARCHAR(16) NOT NULL DEFAULT 'student',
+    preferred_language VARCHAR(16) NOT NULL DEFAULT 'zh',
+    light_background VARCHAR(255) NOT NULL DEFAULT '/backgrounds/light-1.jpg',
+    dark_background VARCHAR(255) NOT NULL DEFAULT '/backgrounds/dark-1.jpg',
     is_active TINYINT(1) NOT NULL DEFAULT 1,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -33,6 +36,19 @@ CREATE TABLE IF NOT EXISTS users (
 """
 
 VALID_USER_TYPES = {"student", "teacher", "maintenance", "admin"}
+VALID_PREFERRED_LANGUAGES = {"en", "zh"}
+VALID_LIGHT_BACKGROUNDS = {
+    "/backgrounds/light-1.jpg",
+    "/backgrounds/light-2.jpg",
+    "/backgrounds/light-3.jpg",
+}
+VALID_DARK_BACKGROUNDS = {
+    "/backgrounds/dark-1.jpg",
+    "/backgrounds/dark-2.jpg",
+}
+DEFAULT_PREFERRED_LANGUAGE = "zh"
+DEFAULT_LIGHT_BACKGROUND = "/backgrounds/light-1.jpg"
+DEFAULT_DARK_BACKGROUND = "/backgrounds/dark-1.jpg"
 
 
 @dataclass(frozen=True)
@@ -43,6 +59,9 @@ class User:
     avatar_sha256: str
     display_name: str
     user_type: str
+    preferred_language: str
+    light_background: str
+    dark_background: str
     is_active: bool
 
 
@@ -107,6 +126,26 @@ def _normalize_user_type(user_type: str | None) -> str:
     return normalized_user_type
 
 
+def _normalize_preferred_language(preferred_language: str | None) -> str:
+    normalized_language = (preferred_language or DEFAULT_PREFERRED_LANGUAGE).strip().lower()
+    if normalized_language not in VALID_PREFERRED_LANGUAGES:
+        raise ValueError("Invalid preferred language")
+
+    return normalized_language
+
+
+def _normalize_background(
+    background: str | None,
+    allowed_backgrounds: set[str],
+    default_background: str,
+) -> str:
+    normalized_background = (background or default_background).strip()
+    if normalized_background not in allowed_backgrounds:
+        raise ValueError("Invalid background")
+
+    return normalized_background
+
+
 def _row_to_user(row: Mapping[str, object]) -> User:
     return User(
         id=int(row["id"]),
@@ -115,6 +154,9 @@ def _row_to_user(row: Mapping[str, object]) -> User:
         avatar_sha256=str(row["avatar_sha256"]),
         display_name=str(row["display_name"]),
         user_type=str(row.get("user_type") or "student"),
+        preferred_language=str(row.get("preferred_language") or DEFAULT_PREFERRED_LANGUAGE),
+        light_background=str(row.get("light_background") or DEFAULT_LIGHT_BACKGROUND),
+        dark_background=str(row.get("dark_background") or DEFAULT_DARK_BACKGROUND),
         is_active=bool(row["is_active"]),
     )
 
@@ -172,6 +214,7 @@ class UserService:
     def _initialize_database(self) -> None:
         with self._engine.begin() as connection:
             connection.execute(text(CREATE_USERS_SQL))
+            self._ensure_user_preference_columns(connection)
 
     def _mysql_column_exists(self, connection: Connection, column_name: str) -> bool:
         if self._engine.dialect.name != "mysql":
@@ -260,6 +303,40 @@ class UserService:
                 """
             )
         )
+
+    def _ensure_user_preference_columns(self, connection: Connection) -> None:
+        if self._engine.dialect.name != "mysql":
+            return
+
+        if not self._mysql_column_exists(connection, "preferred_language"):
+            connection.execute(
+                text(
+                    """
+                    ALTER TABLE users
+                    ADD COLUMN preferred_language VARCHAR(16) NOT NULL DEFAULT 'zh' AFTER user_type
+                    """
+                )
+            )
+
+        if not self._mysql_column_exists(connection, "light_background"):
+            connection.execute(
+                text(
+                    """
+                    ALTER TABLE users
+                    ADD COLUMN light_background VARCHAR(255) NOT NULL DEFAULT '/backgrounds/light-1.jpg' AFTER preferred_language
+                    """
+                )
+            )
+
+        if not self._mysql_column_exists(connection, "dark_background"):
+            connection.execute(
+                text(
+                    """
+                    ALTER TABLE users
+                    ADD COLUMN dark_background VARCHAR(255) NOT NULL DEFAULT '/backgrounds/dark-1.jpg' AFTER light_background
+                    """
+                )
+            )
 
     def _ensure_admin_user_exists(self, connection: Connection) -> None:
         admin_count = connection.execute(
@@ -375,6 +452,9 @@ class UserService:
                         password_hash,
                         display_name,
                         user_type,
+                        preferred_language,
+                        light_background,
+                        dark_background,
                         is_active
                     FROM users
                     WHERE username = :identifier OR email = :identifier
@@ -415,6 +495,9 @@ class UserService:
                         avatar_sha256,
                         display_name,
                         user_type,
+                        preferred_language,
+                        light_background,
+                        dark_background,
                         is_active
                     FROM users
                     WHERE id = :user_id
@@ -427,6 +510,49 @@ class UserService:
             return None
 
         return _row_to_user(row)
+
+    def update_user_preferences(
+        self,
+        user_id: int,
+        preferred_language: str,
+        light_background: str,
+        dark_background: str,
+    ) -> User | None:
+        normalized_language = _normalize_preferred_language(preferred_language)
+        normalized_light_background = _normalize_background(
+            light_background,
+            VALID_LIGHT_BACKGROUNDS,
+            DEFAULT_LIGHT_BACKGROUND,
+        )
+        normalized_dark_background = _normalize_background(
+            dark_background,
+            VALID_DARK_BACKGROUNDS,
+            DEFAULT_DARK_BACKGROUND,
+        )
+
+        with self._engine.begin() as connection:
+            result = connection.execute(
+                text(
+                    """
+                    UPDATE users
+                    SET preferred_language = :preferred_language,
+                        light_background = :light_background,
+                        dark_background = :dark_background,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = :user_id
+                    """
+                ),
+                {
+                    "user_id": user_id,
+                    "preferred_language": normalized_language,
+                    "light_background": normalized_light_background,
+                    "dark_background": normalized_dark_background,
+                },
+            )
+            if result.rowcount == 0:
+                return None
+
+        return self.get_user_by_id(user_id)
 
     def list_admin_users(self) -> list[AdminUser]:
         with self._engine.connect() as connection:
