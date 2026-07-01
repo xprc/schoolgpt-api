@@ -22,6 +22,7 @@ from api.services.user_service import (
     _email_to_avatar_sha256,
     _hash_password,
 )
+from api.services.web_search_config_service import CREATE_WEB_SEARCH_CONFIGS_SQL
 
 
 class SetupAlreadyCompleteError(Exception):
@@ -88,6 +89,7 @@ def initialize_first_run(request: FirstRunSetupRequest) -> None:
             connection.execute(text(CREATE_CONVERSATION_PERMISSIONS_SQL))
             connection.execute(text(CREATE_USER_MEMORIES_SQL))
             connection.execute(text(CREATE_MODEL_CONFIGS_SQL))
+            connection.execute(text(CREATE_WEB_SEARCH_CONFIGS_SQL))
 
             defaults = MODEL_PROVIDER_DEFAULTS["deepseek"]
             connection.execute(
@@ -118,6 +120,24 @@ def initialize_first_run(request: FirstRunSetupRequest) -> None:
                     "base_url": str(defaults["base_url"]),
                     "api_path": str(defaults["api_path"]),
                 },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO web_search_configs (
+                        provider,
+                        api_key,
+                        is_enabled
+                    )
+                    SELECT
+                        'tavily',
+                        '',
+                        TRUE
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM web_search_configs WHERE provider = 'tavily'
+                    )
+                    """
+                )
             )
             connection.execute(
                 text(

@@ -87,6 +87,22 @@ class ModelConfigUpdateRequest(BaseModel):
     api_key: str | None = Field(None, max_length=512)
 
 
+class WebSearchConfigResponse(BaseModel):
+    id: int
+    provider: Literal["tavily"]
+    provider_label: str
+    has_api_key: bool
+    api_key_mask: str
+    is_enabled: bool
+    created_at: str
+    updated_at: str
+
+
+class WebSearchConfigUpdateRequest(BaseModel):
+    api_key: str | None = Field(None, max_length=512)
+    is_enabled: bool = True
+
+
 class RagKnowledgeFileResponse(BaseModel):
     name: str
     size: int

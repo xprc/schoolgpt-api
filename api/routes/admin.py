@@ -14,6 +14,8 @@ from api.schemas.admin import (
     ModelConfigUpdateRequest,
     ModelProviderOptionResponse,
     RagStatusResponse,
+    WebSearchConfigResponse,
+    WebSearchConfigUpdateRequest,
 )
 from api.services.conversation_service import (
     AdminConversationSummary,
@@ -31,6 +33,11 @@ from api.services.user_service import (
     User,
     UserService,
     get_user_service,
+)
+from api.services.web_search_config_service import (
+    WebSearchConfig,
+    WebSearchConfigService,
+    get_web_search_config_service,
 )
 from rag.vector_store import get_vector_store_service
 
@@ -112,6 +119,22 @@ def _to_model_config_response(model_config: ModelConfig) -> ModelConfigResponse:
         is_active=model_config.is_active,
         created_at=model_config.created_at,
         updated_at=model_config.updated_at,
+    )
+
+
+def _to_web_search_config_response(
+    web_search_config: WebSearchConfig,
+) -> WebSearchConfigResponse:
+    api_key = web_search_config.api_key.strip()
+    return WebSearchConfigResponse(
+        id=web_search_config.id,
+        provider=web_search_config.provider,
+        provider_label=web_search_config.provider_label,
+        has_api_key=bool(api_key),
+        api_key_mask=_api_key_mask(api_key),
+        is_enabled=web_search_config.is_enabled,
+        created_at=web_search_config.created_at,
+        updated_at=web_search_config.updated_at,
     )
 
 
@@ -350,6 +373,38 @@ async def update_model_config(
         ) from exc
 
     return _to_model_config_response(model_config)
+
+
+@router.get("/web-search-config", response_model=WebSearchConfigResponse)
+async def get_web_search_config(
+    _: User = Depends(require_admin_user),
+    web_search_config_service: WebSearchConfigService = Depends(
+        get_web_search_config_service
+    ),
+) -> WebSearchConfigResponse:
+    return _to_web_search_config_response(web_search_config_service.get_config())
+
+
+@router.put("/web-search-config", response_model=WebSearchConfigResponse)
+async def update_web_search_config(
+    request: WebSearchConfigUpdateRequest,
+    _: User = Depends(require_admin_user),
+    web_search_config_service: WebSearchConfigService = Depends(
+        get_web_search_config_service
+    ),
+) -> WebSearchConfigResponse:
+    try:
+        web_search_config = web_search_config_service.update_config(
+            api_key=request.api_key,
+            is_enabled=request.is_enabled,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    return _to_web_search_config_response(web_search_config)
 
 
 @router.get("/rag", response_model=RagStatusResponse)

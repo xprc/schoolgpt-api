@@ -2,7 +2,7 @@ import json
 
 from langchain.agents import create_agent
 from agent.tools.middleware import monitor_tool, log_before_model, report_prompt_switch
-from agent.tools.agent_tools import policy_rag_search, user_memory
+from agent.tools.agent_tools import policy_rag_search, user_memory, web_search
 from agent.tools.user_context import (
     reset_current_agent_user_id,
     set_current_agent_user_id,
@@ -16,7 +16,7 @@ class ReactAgent(object):
         self.agent = create_agent(
             model=model or create_webchat_model(),
             system_prompt=load_system_prompt(),
-            tools=[policy_rag_search, user_memory],
+            tools=[policy_rag_search, user_memory, web_search],
             middleware=[monitor_tool, log_before_model, report_prompt_switch],
         )
 
