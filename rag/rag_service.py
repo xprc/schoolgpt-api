@@ -32,7 +32,10 @@ class PolicyRagSearchService(object):
         context_docs = self.retriever_docs(query)
         add_rag_sources([
             {
+                "file_id": item.get("file_id"),
                 "file_name": item["file_name"],
+                "chunk_index": item.get("chunk_index"),
+                "snippet": item.get("snippet"),
                 "confidence": item["confidence"],
             }
             for item in context_docs

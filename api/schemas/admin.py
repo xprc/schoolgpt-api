@@ -2,6 +2,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from api.schemas.rag_files import RagFileSummaryResponse
+
 
 UserType = Literal["student", "teacher", "maintenance", "admin"]
 
@@ -103,13 +105,8 @@ class WebSearchConfigUpdateRequest(BaseModel):
     is_enabled: bool = True
 
 
-class RagKnowledgeFileResponse(BaseModel):
-    name: str
-    size: int
-    modified_at: str
-    md5: str
-    indexed: bool
-    chunk_count: int
+class RagKnowledgeFileResponse(RagFileSummaryResponse):
+    pass
 
 
 class RagStatusResponse(BaseModel):

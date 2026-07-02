@@ -300,13 +300,45 @@ def _normalize_rag_sources(
             confidence = 0
 
         normalized_sources.append(
-            {
-                "file_name": file_name,
-                "confidence": max(0, min(1, confidence)),
-            }
+            _normalize_rag_source_payload(
+                file_name=file_name,
+                confidence=max(0, min(1, confidence)),
+                file_id=source.get("file_id"),
+                chunk_index=source.get("chunk_index"),
+                snippet=source.get("snippet"),
+            )
         )
 
     return normalized_sources
+
+
+def _normalize_rag_source_payload(
+    file_name: str,
+    confidence: float,
+    file_id: object = None,
+    chunk_index: object = None,
+    snippet: object = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "file_name": file_name,
+        "confidence": max(0, min(1, confidence)),
+    }
+
+    try:
+        payload["file_id"] = int(file_id)
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        payload["chunk_index"] = int(chunk_index)
+    except (TypeError, ValueError):
+        pass
+
+    snippet_text = str(snippet or "").strip()
+    if snippet_text:
+        payload["snippet"] = snippet_text[:800]
+
+    return payload
 
 
 def _serialize_rag_sources(

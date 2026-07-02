@@ -10,15 +10,9 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+from api.services.rag_file_service import RagFileRecord, get_rag_file_service
 from model.factory import embedding_model
 from utils.config_handler import chroma_conf
-from utils.file_handler import (
-    csv_loader,
-    get_file_md5_hex,
-    listdir_with_allowed_type,
-    pdf_loader,
-    txt_loader,
-)
 from utils.logger_handler import logger
 from utils.path_tools import get_abs_path
 
@@ -34,7 +28,8 @@ class VectorStoreService:
         self.collection_name = chroma_conf["collection_name"]
         self.persist_directory = self._resolve_project_path(chroma_conf["persist_directory"])
         self.data_path = self._resolve_project_path(chroma_conf["data_path"])
-        self.allowed_file_types = tuple(chroma_conf["allow_knowledge_file_type"])
+        self.rag_file_service = get_rag_file_service()
+        self.allowed_file_types = tuple(self.rag_file_service.allowed_file_types())
         self.index_version = (
             f"chunk-{chroma_conf['chunk_size']}-overlap-{chroma_conf['chunk_overlap']}"
         )
@@ -82,13 +77,6 @@ class VectorStoreService:
     def _utc_now() -> str:
         return datetime.now(timezone.utc).isoformat()
 
-    @property
-    def _allowed_exts(self) -> tuple[str, ...]:
-        return tuple(
-            file_type.lower() if file_type.startswith(".") else f".{file_type.lower()}"
-            for file_type in self.allowed_file_types
-        )
-
     def get_retriever(self):
         search_kwargs = {
             "k": chroma_conf["k"],
@@ -128,6 +116,10 @@ class VectorStoreService:
         results = []
 
         for document, raw_score in scored_docs:
+            metadata = document.metadata
+            if not self._is_current_rag_metadata(metadata):
+                continue
+
             confidence = normalize_score(float(raw_score))
             if confidence < float(chroma_conf["score_threshold"]):
                 continue
@@ -135,12 +127,43 @@ class VectorStoreService:
             results.append(
                 {
                     "document": document,
-                    "file_name": self._metadata_file_name(document.metadata),
+                    "file_id": self._metadata_file_id(metadata),
+                    "file_name": self._metadata_file_name(metadata),
+                    "chunk_index": self._metadata_chunk_index(metadata),
+                    "snippet": self._snippet(document.page_content),
                     "confidence": confidence,
                 }
             )
 
         return results
+
+    def get_chunk_detail(self, file_id: int, chunk_index: int) -> dict[str, Any] | None:
+        try:
+            result = self.vector_store.get(where={"file_id": int(file_id)})
+        except Exception as exc:
+            logger.warning("[RAG] Failed to read chunk %s:%s: %s", file_id, chunk_index, str(exc))
+            return None
+
+        documents = result.get("documents", [])
+        metadatas = result.get("metadatas", [])
+
+        for document_text, metadata in zip(documents, metadatas):
+            if not metadata:
+                continue
+
+            if (
+                metadata.get("chunk_index") == int(chunk_index)
+                and metadata.get("index_version") == self.index_version
+            ):
+                return {
+                    "file_id": int(file_id),
+                    "file_name": self._metadata_file_name(metadata),
+                    "chunk_index": int(chunk_index),
+                    "snippet": self._snippet(str(document_text or ""), limit=1200),
+                    "metadata": metadata,
+                }
+
+        return None
 
     def get_status(self) -> dict[str, Any]:
         files = self.list_knowledge_files()
@@ -158,73 +181,53 @@ class VectorStoreService:
         }
 
     def list_knowledge_files(self) -> list[dict[str, Any]]:
-        files = listdir_with_allowed_type(self.data_path, self.allowed_file_types)
-        return [self._file_info(path) for path in sorted(files, key=lambda item: item.name)]
+        return [self._file_info(file_record) for file_record in self.rag_file_service.list_files()]
 
-    def resolve_upload_target(self, filename: str) -> Path:
-        safe_name = Path(filename).name.strip()
-
-        if not safe_name or safe_name in {".", ".."}:
-            raise ValueError("文件名无效")
-
-        suffix = Path(safe_name).suffix.lower()
-        if suffix not in self._allowed_exts:
-            allowed = ", ".join(self.allowed_file_types)
-            raise ValueError(f"仅支持上传以下文件类型: {allowed}")
-
-        target_path = (self.data_path / safe_name).resolve()
-        data_root = self.data_path.resolve()
-
-        if target_path.parent != data_root:
-            raise ValueError("文件名无效")
-
-        return target_path
-
-    def delete_knowledge_file(self, filename: str) -> None:
-        target_path = self.resolve_upload_target(filename)
-
-        if not target_path.exists() or not target_path.is_file():
-            raise FileNotFoundError("文件不存在")
-
-        target_path.unlink()
+    def delete_knowledge_file(self, file_id: int) -> None:
+        self.rag_file_service.delete_file(file_id)
         self.sync_documents()
 
-    def sync_documents(self) -> dict[str, int]:
+    def sync_file(self, file_id: int) -> dict[str, int]:
+        with self._lock:
+            file_record = self.rag_file_service.get_file(file_id, include_content=True)
+            if file_record is None:
+                raise FileNotFoundError("文件不存在")
+
+            indexed_chunks, skipped_files, _ = self._sync_file_record(file_record)
+            if skipped_files:
+                raise ValueError("文件未生成可入库分片")
+
+            return {
+                "indexed_chunks": indexed_chunks,
+                "skipped_files": skipped_files,
+            }
+
+    def sync_documents(self) -> dict[str, Any]:
         with self._lock:
             indexed_chunks = 0
             skipped_files = 0
             expected_document_ids: set[str] = set()
             sync_had_errors = False
+            failed_file_ids: list[int] = []
 
-            for path in self._list_data_files():
-                md5_hex = get_file_md5_hex(path)
-
-                if not md5_hex:
-                    skipped_files += 1
-                    logger.warning("[RAG] Skip %s because MD5 calculation failed.", path.name)
-                    continue
-
+            for file_record in self.rag_file_service.list_indexable_files():
                 try:
-                    split_documents, document_ids = self._build_documents(path, md5_hex)
-
-                    if not split_documents:
-                        skipped_files += 1
-                        logger.warning("[RAG] Skip %s because it has no valid chunks.", path.name)
-                        continue
-
+                    synced_chunks, skipped_count, document_ids = self._sync_file_record(
+                        file_record
+                    )
+                    indexed_chunks += synced_chunks
+                    skipped_files += skipped_count
                     expected_document_ids.update(document_ids)
-
-                    if self._vectors_exist(document_ids):
-                        continue
-
-                    self._delete_vectors_for_file(path.name)
-                    self.vector_store.add_documents(split_documents, ids=document_ids)
-                    indexed_chunks += len(split_documents)
-                    logger.info("[RAG] Synced %s to %s.", path.name, chroma_conf["persist_directory"])
-
                 except Exception as exc:
                     sync_had_errors = True
-                    logger.error("[RAG] Failed to sync %s: %s", path.name, str(exc), exc_info=True)
+                    failed_file_ids.append(file_record.id)
+                    self.rag_file_service.mark_file_failed(file_record.id, str(exc))
+                    logger.error(
+                        "[RAG] Failed to sync %s: %s",
+                        file_record.original_name,
+                        str(exc),
+                        exc_info=True,
+                    )
 
             if not sync_had_errors:
                 self._delete_unexpected_vectors(expected_document_ids)
@@ -232,9 +235,11 @@ class VectorStoreService:
             return {
                 "indexed_chunks": indexed_chunks,
                 "skipped_files": skipped_files,
+                "failed_files": len(failed_file_ids),
+                "failed_file_ids": failed_file_ids,
             }
 
-    def rebuild_database(self) -> dict[str, int]:
+    def rebuild_database(self) -> dict[str, Any]:
         with self._lock:
             deleted_vectors = self._delete_all_vectors()
             sync_result = self.sync_documents()
@@ -243,32 +248,70 @@ class VectorStoreService:
                 **sync_result,
             }
 
-    def _list_data_files(self) -> tuple[Path, ...]:
-        return listdir_with_allowed_type(self.data_path, self.allowed_file_types)
+    def _sync_file_record(
+        self,
+        file_record: RagFileRecord,
+    ) -> tuple[int, int, list[str]]:
+        split_documents, document_ids = self._build_documents(file_record)
 
-    def _file_info(self, path: Path) -> dict[str, Any]:
-        md5_hex = get_file_md5_hex(path) or ""
-        chunk_count = self._chunk_count_for_file(path.name, md5_hex)
-        stat = path.stat()
+        if not split_documents:
+            self.rag_file_service.update_chunk_count(file_record.id, 0)
+            logger.warning(
+                "[RAG] Skip %s because it has no valid chunks.",
+                file_record.original_name,
+            )
+            return 0, 1, []
+
+        if self._vectors_exist(document_ids):
+            self.rag_file_service.update_chunk_count(
+                file_record.id,
+                len(split_documents),
+            )
+            return 0, 0, document_ids
+
+        self._delete_vectors_for_file(file_record.id)
+        self.vector_store.add_documents(split_documents, ids=document_ids)
+        self.rag_file_service.update_chunk_count(file_record.id, len(split_documents))
+        logger.info(
+            "[RAG] Synced %s to %s.",
+            file_record.original_name,
+            chroma_conf["persist_directory"],
+        )
+
+        return len(split_documents), 0, document_ids
+
+    def _file_info(self, file_record: RagFileRecord) -> dict[str, Any]:
+        chunk_count = self._chunk_count_for_file(file_record.id, file_record.sha256)
 
         return {
-            "name": path.name,
-            "size": stat.st_size,
-            "modified_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
-            "md5": md5_hex,
-            "indexed": chunk_count > 0,
+            "id": file_record.id,
+            "name": file_record.original_name,
+            "size": file_record.size_bytes,
+            "modified_at": file_record.updated_at,
+            "sha256": file_record.sha256,
+            "status": file_record.status,
+            "error_message": file_record.error_message,
+            "indexed": file_record.status == "ready" and chunk_count > 0,
             "chunk_count": chunk_count,
         }
 
-    def _build_documents(self, path: Path, md5_hex: str) -> tuple[list[Document], list[str]]:
-        documents = self._load_file_documents(path)
-
-        if not documents:
+    def _build_documents(self, file_record: RagFileRecord) -> tuple[list[Document], list[str]]:
+        if not file_record.markdown_content.strip():
             return [], []
 
-        split_documents = self.spliter.split_documents(documents)
-        source_ref = f"{Path(chroma_conf['data_path']).name}/{path.name}"
-        source_key = hashlib.sha1(path.name.encode("utf-8")).hexdigest()[:16]
+        source_ref = f"rag_files/{file_record.id}"
+        document = Document(
+            page_content=file_record.markdown_content,
+            metadata={
+                "source": source_ref,
+                "file_path": file_record.markdown_path,
+                "file_id": file_record.id,
+                "file_name": file_record.original_name,
+                "file_sha256": file_record.sha256,
+            },
+        )
+        split_documents = self.spliter.split_documents([document])
+        source_key = hashlib.sha1(str(file_record.id).encode("utf-8")).hexdigest()[:16]
         indexed_at = self._utc_now()
         document_ids = []
 
@@ -276,14 +319,17 @@ class VectorStoreService:
             document.metadata = {
                 **document.metadata,
                 "source": source_ref,
-                "file_path": source_ref,
-                "file_name": path.name,
-                "file_md5": md5_hex,
+                "file_path": file_record.markdown_path,
+                "file_id": file_record.id,
+                "file_name": file_record.original_name,
+                "file_sha256": file_record.sha256,
                 "chunk_index": index,
                 "index_version": self.index_version,
                 "indexed_at": indexed_at,
             }
-            document_ids.append(f"{source_key}:{md5_hex}:{self.index_version}:{index}")
+            document_ids.append(
+                f"{source_key}:{file_record.sha256}:{self.index_version}:{index}"
+            )
 
         return split_documents, document_ids
 
@@ -293,11 +339,40 @@ class VectorStoreService:
         if isinstance(file_name, str) and file_name.strip():
             return file_name
 
-        source = metadata.get("source") or metadata.get("file_path")
-        if isinstance(source, str) and source.strip():
-            return Path(source).name
-
         return "unknown"
+
+    @staticmethod
+    def _metadata_file_id(metadata: dict[str, Any]) -> int | None:
+        file_id = metadata.get("file_id")
+        try:
+            return int(file_id)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _metadata_chunk_index(metadata: dict[str, Any]) -> int | None:
+        chunk_index = metadata.get("chunk_index")
+        try:
+            return int(chunk_index)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _snippet(text: str, limit: int = 280) -> str:
+        normalized = " ".join(str(text or "").split())
+        if len(normalized) <= limit:
+            return normalized
+
+        return normalized[:limit].rstrip() + "..."
+
+    def _is_current_rag_metadata(self, metadata: dict[str, Any]) -> bool:
+        return (
+            self._metadata_file_id(metadata) is not None
+            and self._metadata_chunk_index(metadata) is not None
+            and isinstance(metadata.get("file_sha256"), str)
+            and bool(str(metadata.get("file_sha256")).strip())
+            and metadata.get("index_version") == self.index_version
+        )
 
     @staticmethod
     def _normalize_relevance_score(score: float) -> float:
@@ -307,20 +382,6 @@ class VectorStoreService:
     def _distance_to_confidence(distance: float) -> float:
         return 1 / (1 + max(0, distance))
 
-    @staticmethod
-    def _load_file_documents(path: Path) -> list[Document]:
-        suffix = path.suffix.lower()
-
-        if suffix == ".txt":
-            return txt_loader(path)
-        if suffix == ".pdf":
-            return pdf_loader(path)
-        if suffix == ".csv":
-            return csv_loader(path, source_column="source")
-
-        logger.warning("[RAG] Unsupported file type skipped: %s", suffix)
-        return []
-
     def _vectors_exist(self, document_ids: list[str]) -> bool:
         if not document_ids:
             return False
@@ -328,37 +389,44 @@ class VectorStoreService:
         result = self.vector_store.get(ids=document_ids)
         return set(result.get("ids", [])) == set(document_ids)
 
-    def _chunk_count_for_file(self, filename: str, md5_hex: str) -> int:
+    def _chunk_count_for_file(self, file_id: int, sha256: str) -> int:
         try:
-            result = self.vector_store.get(where={"file_name": filename})
+            result = self.vector_store.get(where={"file_id": file_id})
         except Exception as exc:
-            logger.warning("[RAG] Failed to inspect vectors for %s: %s", filename, str(exc))
+            logger.warning("[RAG] Failed to inspect vectors for %s: %s", file_id, str(exc))
             return 0
 
         metadatas = result.get("metadatas", [])
-        return sum(
+        chunk_count = sum(
             1
             for metadata in metadatas
             if metadata
-            and metadata.get("file_md5") == md5_hex
+            and metadata.get("file_sha256") == sha256
             and metadata.get("index_version") == self.index_version
         )
+        self.rag_file_service.update_chunk_count(file_id, chunk_count)
+        return chunk_count
 
     def _vector_count(self) -> int:
-        collection = getattr(self.vector_store, "_collection", None)
+        try:
+            metadatas = self.vector_store.get().get("metadatas", [])
+        except Exception as exc:
+            logger.warning("[RAG] Failed to count vectors: %s", str(exc))
+            return 0
 
-        if collection is None:
-            return len(self.vector_store.get().get("ids", []))
+        return sum(
+            1
+            for metadata in metadatas
+            if metadata and self._is_current_rag_metadata(metadata)
+        )
 
-        return collection.count()
-
-    def _delete_vectors_for_file(self, filename: str) -> None:
+    def _delete_vectors_for_file(self, file_id: int) -> None:
         collection = getattr(self.vector_store, "_collection", None)
 
         if collection is None:
             return
 
-        collection.delete(where={"file_name": filename})
+        collection.delete(where={"file_id": file_id})
 
     def _delete_unexpected_vectors(self, expected_document_ids: set[str]) -> None:
         try:

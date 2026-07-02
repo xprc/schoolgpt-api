@@ -26,10 +26,10 @@ def add_rag_sources(sources: list[RagSource]) -> None:
         current_sources = []
         _rag_sources.set(current_sources)
 
-    by_file = {
-        str(source.get("file_name", "")): dict(source)
+    by_source = {
+        _source_key(source): dict(source)
         for source in current_sources
-        if source.get("file_name")
+        if _source_key(source)
     }
 
     for source in sources:
@@ -38,20 +38,60 @@ def add_rag_sources(sources: list[RagSource]) -> None:
             continue
 
         confidence = float(source.get("confidence", 0) or 0)
-        current = by_file.get(file_name)
+        normalized_source = _normalize_source(source, file_name, confidence)
+        source_key = _source_key(normalized_source)
+        if not source_key:
+            continue
+
+        current = by_source.get(source_key)
 
         if current is None or confidence > float(current.get("confidence", 0) or 0):
-            by_file[file_name] = {
-                "file_name": file_name,
-                "confidence": max(0, min(1, confidence)),
-            }
+            by_source[source_key] = normalized_source
 
     current_sources[:] = sorted(
-        by_file.values(),
+        by_source.values(),
         key=lambda source: float(source.get("confidence", 0) or 0),
         reverse=True,
-    )
+    )[:10]
 
 
 def get_rag_sources() -> list[RagSource]:
     return [dict(source) for source in (_rag_sources.get() or [])]
+
+
+def _source_key(source: RagSource) -> str:
+    file_id = source.get("file_id")
+    chunk_index = source.get("chunk_index")
+    if file_id is not None and chunk_index is not None:
+        return f"{file_id}:{chunk_index}"
+
+    return str(source.get("file_name", "")).strip()
+
+
+def _normalize_source(
+    source: RagSource,
+    file_name: str,
+    confidence: float,
+) -> RagSource:
+    normalized_source: RagSource = {
+        "file_name": file_name,
+        "confidence": max(0, min(1, confidence)),
+    }
+
+    try:
+        file_id = int(source.get("file_id"))
+        normalized_source["file_id"] = file_id
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        chunk_index = int(source.get("chunk_index"))
+        normalized_source["chunk_index"] = chunk_index
+    except (TypeError, ValueError):
+        pass
+
+    snippet = str(source.get("snippet", "") or "").strip()
+    if snippet:
+        normalized_source["snippet"] = snippet[:800]
+
+    return normalized_source

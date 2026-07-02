@@ -10,21 +10,21 @@ from langchain_community.document_loaders import CSVLoader, TextLoader
 logger = logging.getLogger(__name__)
 
 
-# ================= 1. 文件校验与 MD5 =================
-def get_file_md5_hex(filepath: Union[str, Path]) -> Optional[str]:
-    """计算文件 MD5，用于去重或缓存校验"""
+# ================= 1. 文件校验与 SHA256 =================
+def get_file_sha256_hex(filepath: Union[str, Path]) -> Optional[str]:
+    """计算文件 SHA256，用于上传文件去重。"""
     filepath = Path(filepath)
     if not filepath.exists() or not filepath.is_file():
         logger.warning(f"文件不存在或无效: {filepath}")
         return None
     try:
         with open(filepath, "rb") as f:
-            md5_obj = hashlib.md5()
-            for chunk in iter(lambda: f.read(4096), b""):
-                md5_obj.update(chunk)
-            return md5_obj.hexdigest()
+            sha256_obj = hashlib.sha256()
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                sha256_obj.update(chunk)
+            return sha256_obj.hexdigest()
     except Exception as e:
-        logger.error(f"MD5 计算失败 {filepath}: {e}")
+        logger.error(f"SHA256 计算失败 {filepath}: {e}")
         return None
 
 

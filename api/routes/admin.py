@@ -1,4 +1,12 @@
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    HTTPException,
+    UploadFile,
+    status,
+)
 from sqlalchemy.exc import IntegrityError
 
 from api.core.security import TokenPayload, get_current_token_payload
@@ -39,6 +47,7 @@ from api.services.web_search_config_service import (
     WebSearchConfigService,
     get_web_search_config_service,
 )
+from api.services.rag_file_service import get_rag_file_service
 from rag.vector_store import get_vector_store_service
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -152,6 +161,36 @@ def _to_provider_option_response(
 
 def _get_rag_status_response() -> RagStatusResponse:
     return RagStatusResponse(**get_vector_store_service().get_status())
+
+
+def _process_rag_file_task(file_id: int) -> None:
+    rag_file_service = get_rag_file_service()
+    try:
+        rag_file_service.convert_file_to_markdown_record(file_id)
+        get_vector_store_service().sync_file(file_id)
+        rag_file_service.mark_file_ready(file_id)
+    except FileNotFoundError:
+        return
+    except Exception as exc:
+        rag_file_service.mark_file_failed(file_id, str(exc))
+
+
+def _rebuild_rag_database_task(file_ids: list[int]) -> None:
+    rag_file_service = get_rag_file_service()
+    try:
+        result = get_vector_store_service().rebuild_database()
+        failed_file_ids = {
+            int(file_id)
+            for file_id in result.get("failed_file_ids", [])
+        }
+        rag_file_service.mark_files_ready(
+            file_id
+            for file_id in file_ids
+            if file_id not in failed_file_ids
+        )
+    except Exception as exc:
+        for file_id in file_ids:
+            rag_file_service.mark_file_failed(file_id, str(exc))
 
 
 @router.get("/dashboard", response_model=AdminDashboardResponse)
@@ -416,6 +455,7 @@ async def get_rag_status(
 
 @router.post("/rag/files", response_model=RagStatusResponse)
 async def upload_rag_files(
+    background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
     _: User = Depends(require_admin_user),
 ) -> RagStatusResponse:
@@ -423,35 +463,57 @@ async def upload_rag_files(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="请选择要上传的文件",
-        )
+    )
 
-    vector_store_service = get_vector_store_service()
+    rag_file_service = get_rag_file_service()
+    process_file_ids: set[int] = set()
 
     for upload_file in files:
         try:
-            target_path = vector_store_service.resolve_upload_target(upload_file.filename or "")
+            temp_path = rag_file_service.create_temp_upload_path(
+                upload_file.filename or ""
+            )
         except ValueError as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=str(exc),
             ) from exc
 
-        with target_path.open("wb") as output_file:
-            while chunk := await upload_file.read(1024 * 1024):
-                output_file.write(chunk)
+        try:
+            with temp_path.open("wb") as output_file:
+                while chunk := await upload_file.read(1024 * 1024):
+                    output_file.write(chunk)
 
-        await upload_file.close()
+            prepared_file = rag_file_service.prepare_uploaded_file(
+                original_name=upload_file.filename or "",
+                uploaded_path=temp_path,
+                mime_type=upload_file.content_type,
+            )
+            if prepared_file.should_process:
+                process_file_ids.add(prepared_file.record.id)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+        finally:
+            if temp_path.exists() and temp_path.is_file():
+                temp_path.unlink()
+            await upload_file.close()
+
+    for file_id in sorted(process_file_ids):
+        background_tasks.add_task(_process_rag_file_task, file_id)
 
     return _get_rag_status_response()
 
 
-@router.delete("/rag/files/{file_name}", response_model=RagStatusResponse)
+@router.delete("/rag/files/{file_id}", response_model=RagStatusResponse)
 async def delete_rag_file(
-    file_name: str,
+    file_id: int,
     _: User = Depends(require_admin_user),
 ) -> RagStatusResponse:
     try:
-        get_vector_store_service().delete_knowledge_file(file_name)
+        get_vector_store_service().delete_knowledge_file(file_id)
     except FileNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -468,7 +530,11 @@ async def delete_rag_file(
 
 @router.post("/rag/rebuild", response_model=RagStatusResponse)
 async def rebuild_rag_database(
+    background_tasks: BackgroundTasks,
     _: User = Depends(require_admin_user),
 ) -> RagStatusResponse:
-    get_vector_store_service().rebuild_database()
+    rag_file_service = get_rag_file_service()
+    file_ids = [record.id for record in rag_file_service.list_indexable_files()]
+    rag_file_service.mark_files_indexing(file_ids)
+    background_tasks.add_task(_rebuild_rag_database_task, file_ids)
     return _get_rag_status_response()

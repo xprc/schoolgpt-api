@@ -8,6 +8,7 @@ from api.routes.auth import router as auth_router
 from api.routes.chat import router as chat_router
 from api.routes.conversations import router as conversations_router
 from api.routes.memories import router as memories_router
+from api.routes.rag_files import router as rag_files_router
 from api.routes.setup import router as setup_router
 
 
@@ -36,6 +37,7 @@ def create_app() -> FastAPI:
     app.include_router(chat_router, prefix=settings.api_prefix)
     app.include_router(conversations_router, prefix=settings.api_prefix)
     app.include_router(memories_router, prefix=settings.api_prefix)
+    app.include_router(rag_files_router, prefix=settings.api_prefix)
     return app
 
 
