@@ -1,4 +1,5 @@
 import hashlib
+import json
 import threading
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -10,7 +11,11 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from api.services.rag_file_service import RagFileRecord, get_rag_file_service
+from api.services.rag_file_service import (
+    RagFileRecord,
+    get_rag_file_service,
+    structured_content_text_blocks,
+)
 from model.factory import embedding_model
 from utils.config_handler import chroma_conf
 from utils.logger_handler import logger
@@ -130,6 +135,7 @@ class VectorStoreService:
                     "file_id": self._metadata_file_id(metadata),
                     "file_name": self._metadata_file_name(metadata),
                     "chunk_index": self._metadata_chunk_index(metadata),
+                    "page_number": self._metadata_page_number(metadata),
                     "snippet": self._snippet(document.page_content),
                     "confidence": confidence,
                 }
@@ -159,6 +165,7 @@ class VectorStoreService:
                     "file_id": int(file_id),
                     "file_name": self._metadata_file_name(metadata),
                     "chunk_index": int(chunk_index),
+                    "page_number": self._metadata_page_number(metadata),
                     "snippet": self._snippet(str(document_text or ""), limit=1200),
                     "metadata": metadata,
                 }
@@ -296,21 +303,36 @@ class VectorStoreService:
         }
 
     def _build_documents(self, file_record: RagFileRecord) -> tuple[list[Document], list[str]]:
-        if not file_record.markdown_content.strip():
+        blocks = structured_content_text_blocks(file_record.content_json)
+        if not blocks:
             return [], []
 
         source_ref = f"rag_files/{file_record.id}"
-        document = Document(
-            page_content=file_record.markdown_content,
-            metadata={
-                "source": source_ref,
-                "file_path": file_record.markdown_path,
-                "file_id": file_record.id,
-                "file_name": file_record.original_name,
-                "file_sha256": file_record.sha256,
-            },
-        )
-        split_documents = self.spliter.split_documents([document])
+        documents = []
+        for block in blocks:
+            documents.append(
+                Document(
+                    page_content=str(block["text"]),
+                    metadata={
+                        "source": source_ref,
+                        "file_path": file_record.preview_pdf_path,
+                        "file_id": file_record.id,
+                        "file_name": file_record.original_name,
+                        "file_sha256": file_record.sha256,
+                        "source_format": "structured-json",
+                        "page_number": int(block["page_number"]),
+                        "block_id": str(block["id"]),
+                        "block_type": str(block["type"]),
+                        "bbox_json": (
+                            json.dumps(block["bbox"], ensure_ascii=False)
+                            if block.get("bbox") is not None
+                            else ""
+                        ),
+                    },
+                )
+            )
+
+        split_documents = self.spliter.split_documents(documents)
         source_key = hashlib.sha1(str(file_record.id).encode("utf-8")).hexdigest()[:16]
         indexed_at = self._utc_now()
         document_ids = []
@@ -319,10 +341,11 @@ class VectorStoreService:
             document.metadata = {
                 **document.metadata,
                 "source": source_ref,
-                "file_path": file_record.markdown_path,
+                "file_path": file_record.preview_pdf_path,
                 "file_id": file_record.id,
                 "file_name": file_record.original_name,
                 "file_sha256": file_record.sha256,
+                "source_format": "structured-json",
                 "chunk_index": index,
                 "index_version": self.index_version,
                 "indexed_at": indexed_at,
@@ -358,6 +381,14 @@ class VectorStoreService:
             return None
 
     @staticmethod
+    def _metadata_page_number(metadata: dict[str, Any]) -> int | None:
+        page_number = metadata.get("page_number")
+        try:
+            return int(page_number)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
     def _snippet(text: str, limit: int = 280) -> str:
         normalized = " ".join(str(text or "").split())
         if len(normalized) <= limit:
@@ -371,6 +402,7 @@ class VectorStoreService:
             and self._metadata_chunk_index(metadata) is not None
             and isinstance(metadata.get("file_sha256"), str)
             and bool(str(metadata.get("file_sha256")).strip())
+            and metadata.get("source_format") == "structured-json"
             and metadata.get("index_version") == self.index_version
         )
 
@@ -402,6 +434,7 @@ class VectorStoreService:
             for metadata in metadatas
             if metadata
             and metadata.get("file_sha256") == sha256
+            and metadata.get("source_format") == "structured-json"
             and metadata.get("index_version") == self.index_version
         )
         self.rag_file_service.update_chunk_count(file_id, chunk_count)

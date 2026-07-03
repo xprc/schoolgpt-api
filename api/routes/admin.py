@@ -166,7 +166,7 @@ def _get_rag_status_response() -> RagStatusResponse:
 def _process_rag_file_task(file_id: int) -> None:
     rag_file_service = get_rag_file_service()
     try:
-        rag_file_service.convert_file_to_markdown_record(file_id)
+        rag_file_service.process_file_record(file_id)
         get_vector_store_service().sync_file(file_id)
         rag_file_service.mark_file_ready(file_id)
     except FileNotFoundError:
@@ -463,7 +463,7 @@ async def upload_rag_files(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="请选择要上传的文件",
-    )
+        )
 
     rag_file_service = get_rag_file_service()
     process_file_ids: set[int] = set()

@@ -35,6 +35,7 @@ class PolicyRagSearchService(object):
                 "file_id": item.get("file_id"),
                 "file_name": item["file_name"],
                 "chunk_index": item.get("chunk_index"),
+                "page_number": item.get("page_number"),
                 "snippet": item.get("snippet"),
                 "confidence": item["confidence"],
             }

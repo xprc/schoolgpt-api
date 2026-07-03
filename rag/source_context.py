@@ -90,6 +90,12 @@ def _normalize_source(
     except (TypeError, ValueError):
         pass
 
+    try:
+        page_number = int(source.get("page_number"))
+        normalized_source["page_number"] = page_number
+    except (TypeError, ValueError):
+        pass
+
     snippet = str(source.get("snippet", "") or "").strip()
     if snippet:
         normalized_source["snippet"] = snippet[:800]

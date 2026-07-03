@@ -1,8 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import FileResponse
 
 from api.core.security import TokenPayload, get_current_token_payload
 from api.schemas.rag_files import RagFileDetailResponse, RagFileSummaryResponse
-from api.services.rag_file_service import RagFileRecord, RagFileService, get_rag_file_service
+from api.services.rag_file_service import (
+    RagFileRecord,
+    RagFileService,
+    get_rag_file_service,
+)
 from rag.vector_store import get_vector_store_service
 
 router = APIRouter(prefix="/rag/files", tags=["rag-files"])
@@ -51,11 +56,36 @@ async def get_rag_file(
     summary = _to_file_summary(record)
     return RagFileDetailResponse(
         **summary.model_dump(),
-        markdown=record.markdown_content,
         chunk_index=chunk_index,
+        page_number=(
+            int(chunk_detail.get("page_number"))
+            if chunk_detail and chunk_detail.get("page_number") is not None
+            else None
+        ),
         snippet=(
             str(chunk_detail.get("snippet"))
             if chunk_detail and chunk_detail.get("snippet")
             else None
         ),
+    )
+
+
+@router.get("/{file_id}/preview")
+async def get_rag_file_preview(
+    file_id: int,
+    _: TokenPayload = Depends(get_current_token_payload),
+    service: RagFileService = Depends(get_rag_file_service),
+) -> FileResponse:
+    try:
+        preview_path = service.get_preview_pdf_path(file_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+
+    return FileResponse(
+        preview_path,
+        media_type="application/pdf",
+        filename=preview_path.name,
     )

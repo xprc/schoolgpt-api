@@ -1,4 +1,6 @@
 import csv
+import json
+import os
 import re
 import shutil
 import subprocess
@@ -8,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import pdfplumber
@@ -28,8 +31,9 @@ CREATE TABLE IF NOT EXISTS rag_files (
     size_bytes BIGINT UNSIGNED NOT NULL,
     sha256 CHAR(64) NOT NULL,
     source_path VARCHAR(512) NOT NULL,
-    markdown_path VARCHAR(512) NOT NULL,
-    markdown_content MEDIUMTEXT NOT NULL,
+    content_json_path VARCHAR(512) NOT NULL,
+    preview_pdf_path VARCHAR(512) NOT NULL,
+    content_json LONGTEXT NOT NULL,
     status VARCHAR(16) NOT NULL DEFAULT 'pending',
     error_message TEXT NULL,
     chunk_count INT UNSIGNED NOT NULL DEFAULT 0,
@@ -48,13 +52,13 @@ ALLOWED_RAG_UPLOAD_EXTENSIONS = (
     ".txt",
     ".pdf",
     ".csv",
-    ".md",
     ".xls",
     ".xlsx",
 )
 
 RAG_FILE_STATUS_PENDING = "pending"
-RAG_FILE_STATUS_CONVERTING = "converting"
+RAG_FILE_STATUS_EXTRACTING = "extracting"
+RAG_FILE_STATUS_RENDERING = "rendering"
 RAG_FILE_STATUS_INDEXING = "indexing"
 RAG_FILE_STATUS_READY = "ready"
 RAG_FILE_STATUS_FAILED = "failed"
@@ -62,6 +66,9 @@ RAG_FILE_INDEXABLE_STATUSES = (
     RAG_FILE_STATUS_READY,
     RAG_FILE_STATUS_INDEXING,
 )
+
+STRUCTURED_CONTENT_VERSION = 1
+TABLE_ROWS_PER_BLOCK = 24
 
 
 @dataclass(frozen=True)
@@ -73,8 +80,9 @@ class RagFileRecord:
     size_bytes: int
     sha256: str
     source_path: str
-    markdown_path: str
-    markdown_content: str
+    content_json_path: str
+    preview_pdf_path: str
+    content_json: str
     status: str
     error_message: str | None
     chunk_count: int
@@ -134,33 +142,197 @@ def _resolve_project_path(path_value: str) -> Path:
     return target
 
 
+def _clean_text(value: object) -> str:
+    return str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
 def _clean_cell(value: object) -> str:
-    text_value = str(value or "").replace("\r", " ").replace("\n", "<br>")
-    return text_value.replace("|", "\\|").strip()
+    return " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split())
 
 
-def _markdown_table(headers: Iterable[object], rows: Iterable[Iterable[object]]) -> str:
-    header_values = [_clean_cell(header) or " " for header in headers]
-    if not header_values:
-        return ""
+def _normalize_table_rows(rows: Iterable[Iterable[object]]) -> list[list[str]]:
+    cleaned_rows = [[_clean_cell(cell) for cell in row] for row in rows]
+    cleaned_rows = [row for row in cleaned_rows if any(row)]
+    if not cleaned_rows:
+        return []
 
-    lines = [
-        "| " + " | ".join(header_values) + " |",
-        "| " + " | ".join("---" for _ in header_values) + " |",
+    max_columns = max(len(row) for row in cleaned_rows)
+    padded_rows = [row + [""] * (max_columns - len(row)) for row in cleaned_rows]
+    keep_columns = [
+        column_index
+        for column_index in range(max_columns)
+        if any(row[column_index] for row in padded_rows)
+    ]
+    if not keep_columns:
+        return []
+
+    return [[row[column_index] for column_index in keep_columns] for row in padded_rows]
+
+
+def _table_to_text(rows: Iterable[Iterable[object]]) -> str:
+    lines = []
+    for row in _normalize_table_rows(rows):
+        cells = [cell for cell in row if cell]
+        if cells:
+            lines.append(" | ".join(cells))
+
+    return "\n".join(lines).strip()
+
+
+def _make_block(
+    page_number: int,
+    block_index: int,
+    block_type: str,
+    text_value: str,
+    bbox: list[float] | None = None,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    normalized_text = _clean_text(text_value)
+    if not normalized_text:
+        return None
+
+    block = {
+        "id": f"p{page_number}-b{block_index}",
+        "type": block_type,
+        "text": normalized_text,
+        "page_number": max(1, int(page_number)),
+        "bbox": bbox,
+    }
+    if extra:
+        block.update(dict(extra))
+
+    return block
+
+
+def _make_table_blocks(
+    page_number: int,
+    start_block_index: int,
+    rows: Iterable[Iterable[object]],
+    title: str | None = None,
+) -> list[dict[str, Any]]:
+    normalized_rows = _normalize_table_rows(rows)
+    if not normalized_rows:
+        return []
+
+    header = normalized_rows[0]
+    body_rows = normalized_rows[1:]
+    row_groups = [normalized_rows] if not body_rows else [
+        [header, *body_rows[index:index + TABLE_ROWS_PER_BLOCK]]
+        for index in range(0, len(body_rows), TABLE_ROWS_PER_BLOCK)
     ]
 
-    for row in rows:
-        cells = [_clean_cell(cell) for cell in row]
-        if len(cells) < len(header_values):
-            cells.extend("" for _ in range(len(header_values) - len(cells)))
-        lines.append("| " + " | ".join(cells[: len(header_values)]) + " |")
+    blocks = []
+    for group_index, row_group in enumerate(row_groups):
+        block_title = ""
+        if title:
+            block_title = title if group_index == 0 else f"{title}（续 {group_index + 1}）"
 
-    return "\n".join(lines)
+        table_text = _table_to_text(row_group)
+        text_value = f"{block_title}\n{table_text}" if block_title else table_text
+        block = _make_block(
+            page_number,
+            start_block_index + group_index,
+            "table",
+            text_value,
+            extra={
+                "title": block_title,
+                "rows": row_group,
+            },
+        )
+        if block:
+            blocks.append(block)
+
+    return blocks
 
 
-def _dataframe_to_markdown(dataframe: pd.DataFrame) -> str:
-    dataframe = dataframe.fillna("")
-    return _markdown_table(dataframe.columns, dataframe.itertuples(index=False, name=None))
+def _new_structured_content(
+    original_name: str,
+    extension: str,
+    sha256: str,
+    pages: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "version": STRUCTURED_CONTENT_VERSION,
+        "file": {
+            "name": original_name,
+            "extension": extension.lstrip("."),
+            "sha256": sha256,
+        },
+        "pages": pages,
+    }
+
+
+def _iter_blocks(content: Mapping[str, Any]) -> Iterable[dict[str, Any]]:
+    pages = content.get("pages")
+    if not isinstance(pages, list):
+        return
+
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+
+        blocks = page.get("blocks")
+        if not isinstance(blocks, list):
+            continue
+
+        for block in blocks:
+            if isinstance(block, dict):
+                yield block
+
+
+def structured_content_text_blocks(content_json: str) -> list[dict[str, Any]]:
+    try:
+        content = json.loads(content_json or "{}")
+    except json.JSONDecodeError:
+        return []
+
+    blocks = []
+    for block in _iter_blocks(content):
+        text_value = _clean_text(block.get("text"))
+        if not text_value:
+            continue
+
+        page_number = block.get("page_number")
+        try:
+            normalized_page_number = int(page_number)
+        except (TypeError, ValueError):
+            normalized_page_number = 1
+
+        bbox = block.get("bbox")
+        blocks.append(
+            {
+                "id": str(block.get("id") or ""),
+                "type": str(block.get("type") or "paragraph"),
+                "text": text_value,
+                "page_number": max(1, normalized_page_number),
+                "bbox": bbox if isinstance(bbox, list) else None,
+            }
+        )
+
+    return blocks
+
+
+def _paragraph_blocks_from_text(
+    text_value: str,
+    page_number: int = 1,
+    block_type: str = "paragraph",
+) -> list[dict[str, Any]]:
+    chunks = [
+        chunk.strip()
+        for chunk in re.split(r"\n\s*\n", _clean_text(text_value))
+        if chunk.strip()
+    ]
+
+    if not chunks:
+        chunks = [line.strip() for line in _clean_text(text_value).splitlines() if line.strip()]
+
+    blocks = []
+    for index, chunk in enumerate(chunks, 1):
+        block = _make_block(page_number, index, block_type, chunk)
+        if block:
+            blocks.append(block)
+
+    return blocks
 
 
 def _read_text(path: Path) -> str:
@@ -173,99 +345,123 @@ def _read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="ignore")
 
 
-def _text_file_to_markdown(path: Path) -> str:
-    return _read_text(path).strip()
+def _text_to_structured_content(
+    path: Path,
+    original_name: str,
+    extension: str,
+    sha256: str,
+) -> dict[str, Any]:
+    blocks = _paragraph_blocks_from_text(_read_text(path), page_number=1)
+    return _new_structured_content(
+        original_name,
+        extension,
+        sha256,
+        [{"page_number": 1, "blocks": blocks}],
+    )
 
 
-def _csv_to_markdown(path: Path) -> str:
+def _csv_to_structured_content(
+    path: Path,
+    original_name: str,
+    extension: str,
+    sha256: str,
+) -> dict[str, Any]:
+    rows: list[list[object]]
     for encoding in ("utf-8-sig", "utf-8", "gb18030"):
         try:
-            dataframe = pd.read_csv(path, dtype=str, keep_default_na=False, encoding=encoding)
-            return _dataframe_to_markdown(dataframe)
+            dataframe = pd.read_csv(
+                path,
+                dtype=str,
+                keep_default_na=False,
+                encoding=encoding,
+                header=None,
+            )
+            rows = dataframe.fillna("").values.tolist()
+            break
         except UnicodeDecodeError:
             continue
         except Exception:
+            rows = []
             break
-
-    with path.open("r", encoding="utf-8", errors="ignore", newline="") as csv_file:
-        rows = list(csv.reader(csv_file))
+    else:
+        rows = []
 
     if not rows:
-        return ""
+        with path.open("r", encoding="utf-8", errors="ignore", newline="") as csv_file:
+            rows = list(csv.reader(csv_file))
 
-    return _markdown_table(rows[0], rows[1:])
+    blocks = _make_table_blocks(1, 1, rows)
+    return _new_structured_content(
+        original_name,
+        extension,
+        sha256,
+        [{"page_number": 1, "blocks": blocks}],
+    )
 
 
-def _excel_to_markdown(path: Path) -> str:
+def _excel_to_structured_content(
+    path: Path,
+    original_name: str,
+    extension: str,
+    sha256: str,
+) -> dict[str, Any]:
     try:
-        sheets = pd.read_excel(path, sheet_name=None, dtype=str, keep_default_na=False)
+        sheets = pd.read_excel(
+            path,
+            sheet_name=None,
+            dtype=str,
+            keep_default_na=False,
+            header=None,
+        )
     except ImportError as exc:
-        raise ValueError("Excel 转 Markdown 需要安装 openpyxl/xlrd 依赖") from exc
+        raise ValueError("Excel 解析需要安装 openpyxl/xlrd 依赖") from exc
 
-    markdown_parts = []
-    for sheet_name, dataframe in sheets.items():
-        markdown_parts.append(f"## {sheet_name}\n\n{_dataframe_to_markdown(dataframe)}")
+    pages = []
+    for page_index, (sheet_name, dataframe) in enumerate(sheets.items(), 1):
+        rows = dataframe.fillna("").values.tolist()
+        blocks = _make_table_blocks(page_index, 1, rows, title=f"工作表：{sheet_name}")
+        pages.append(
+            {
+                "page_number": page_index,
+                "blocks": blocks,
+            }
+        )
 
-    return "\n\n".join(markdown_parts)
-
-
-def _docx_table_to_markdown(table) -> str:
-    rows = [
-        [cell.text.strip() for cell in row.cells]
-        for row in table.rows
-    ]
-    if not rows:
-        return ""
-
-    return _markdown_table(rows[0], rows[1:])
+    return _new_structured_content(original_name, extension, sha256, pages)
 
 
-def _docx_to_markdown(path: Path) -> str:
+def _docx_to_blocks(path: Path) -> list[dict[str, Any]]:
     document = DocxDocument(str(path))
-    markdown_parts = []
+    blocks = []
+    block_index = 1
 
     for paragraph in document.paragraphs:
-        text_value = paragraph.text.strip()
-        if text_value:
-            markdown_parts.append(text_value)
+        block = _make_block(1, block_index, "paragraph", paragraph.text)
+        if block:
+            blocks.append(block)
+            block_index += 1
 
     for table in document.tables:
-        table_markdown = _docx_table_to_markdown(table)
-        if table_markdown:
-            markdown_parts.append(table_markdown)
+        rows = [[cell.text.strip() for cell in row.cells] for row in table.rows]
+        table_blocks = _make_table_blocks(1, block_index, rows)
+        blocks.extend(table_blocks)
+        block_index += len(table_blocks)
 
-    return "\n\n".join(markdown_parts)
-
-
-def _pdf_table_to_markdown(table: list[list[object]]) -> str:
-    rows = table or []
-    if not rows:
-        return ""
-
-    return _markdown_table(rows[0], rows[1:])
+    return blocks
 
 
-def _pdf_to_markdown(path: Path) -> str:
-    markdown_parts = []
-
-    with pdfplumber.open(str(path)) as pdf:
-        for page_index, page in enumerate(pdf.pages, 1):
-            page_parts = []
-            text_value = (page.extract_text() or "").strip()
-            if text_value:
-                page_parts.append(text_value)
-
-            for table in page.extract_tables() or []:
-                table_markdown = _pdf_table_to_markdown(table)
-                if table_markdown:
-                    page_parts.append(table_markdown)
-
-            if page_parts:
-                markdown_parts.append(
-                    f"## 第 {page_index} 页\n\n" + "\n\n".join(page_parts)
-                )
-
-    return "\n\n".join(markdown_parts)
+def _docx_to_structured_content(
+    path: Path,
+    original_name: str,
+    extension: str,
+    sha256: str,
+) -> dict[str, Any]:
+    return _new_structured_content(
+        original_name,
+        extension,
+        sha256,
+        [{"page_number": 1, "blocks": _docx_to_blocks(path)}],
+    )
 
 
 def _find_office_binary() -> str | None:
@@ -309,7 +505,12 @@ def _extract_legacy_doc_text(path: Path) -> str:
     return "\n\n".join(unique_lines)
 
 
-def _doc_to_markdown(path: Path) -> str:
+def _doc_to_structured_content(
+    path: Path,
+    original_name: str,
+    extension: str,
+    sha256: str,
+) -> dict[str, Any]:
     office_binary = _find_office_binary()
     if office_binary:
         try:
@@ -330,36 +531,165 @@ def _doc_to_markdown(path: Path) -> str:
                 )
                 converted_path = Path(temp_dir) / f"{path.stem}.docx"
                 if converted_path.exists():
-                    return _docx_to_markdown(converted_path)
+                    return _docx_to_structured_content(
+                        converted_path,
+                        original_name,
+                        extension,
+                        sha256,
+                    )
         except Exception:
             pass
 
-    return _extract_legacy_doc_text(path)
+    blocks = _paragraph_blocks_from_text(_extract_legacy_doc_text(path), page_number=1)
+    return _new_structured_content(
+        original_name,
+        extension,
+        sha256,
+        [{"page_number": 1, "blocks": blocks}],
+    )
 
 
-def convert_file_to_markdown(path: Path, original_name: str) -> str:
+def _pdf_to_structured_content(
+    path: Path,
+    original_name: str,
+    extension: str,
+    sha256: str,
+) -> dict[str, Any]:
+    pages = []
+
+    with pdfplumber.open(str(path)) as pdf:
+        for page_index, page in enumerate(pdf.pages, 1):
+            blocks = []
+            block_index = 1
+            text_value = (page.extract_text() or "").strip()
+            if text_value:
+                block = _make_block(page_index, block_index, "page_text", text_value)
+                if block:
+                    blocks.append(block)
+                    block_index += 1
+
+            for table in page.extract_tables() or []:
+                table_blocks = _make_table_blocks(page_index, block_index, table)
+                blocks.extend(table_blocks)
+                block_index += len(table_blocks)
+
+            pages.append(
+                {
+                    "page_number": page_index,
+                    "blocks": blocks,
+                }
+            )
+
+    return _new_structured_content(original_name, extension, sha256, pages)
+
+
+def extract_structured_content(path: Path, original_name: str, sha256: str) -> dict[str, Any]:
     extension = _extension(original_name)
 
-    if extension in {".txt", ".md"}:
-        markdown = _text_file_to_markdown(path)
+    if extension == ".txt":
+        content = _text_to_structured_content(path, original_name, extension, sha256)
     elif extension == ".csv":
-        markdown = _csv_to_markdown(path)
+        content = _csv_to_structured_content(path, original_name, extension, sha256)
     elif extension in {".xls", ".xlsx"}:
-        markdown = _excel_to_markdown(path)
+        content = _excel_to_structured_content(path, original_name, extension, sha256)
     elif extension == ".docx":
-        markdown = _docx_to_markdown(path)
+        content = _docx_to_structured_content(path, original_name, extension, sha256)
     elif extension == ".doc":
-        markdown = _doc_to_markdown(path)
+        content = _doc_to_structured_content(path, original_name, extension, sha256)
     elif extension == ".pdf":
-        markdown = _pdf_to_markdown(path)
+        content = _pdf_to_structured_content(path, original_name, extension, sha256)
     else:
         raise ValueError(f"不支持的文件类型: {extension}")
 
-    markdown = markdown.strip()
-    if not markdown:
+    if not structured_content_text_blocks(
+        json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+    ):
         raise ValueError("文件未提取到可入库文本")
 
-    return f"# {original_name}\n\n{markdown}\n"
+    return content
+
+
+def _pdf_page_count(path: Path) -> int:
+    try:
+        with pdfplumber.open(str(path)) as pdf:
+            return len(pdf.pages)
+    except Exception:
+        return 0
+
+
+def _update_preview_metadata(content: dict[str, Any], preview_path: Path) -> dict[str, Any]:
+    content["preview"] = {
+        "page_count": _pdf_page_count(preview_path),
+        "format": "pdf",
+    }
+    return content
+
+
+def _copy_pdf_preview(source_path: Path, output_path: Path, content: dict[str, Any]) -> dict[str, Any]:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if source_path.resolve() != output_path.resolve():
+        shutil.copyfile(source_path, output_path)
+
+    return _update_preview_metadata(content, output_path)
+
+
+def _convert_with_libreoffice_to_pdf(source_path: Path, output_path: Path) -> None:
+    office_binary = _find_office_binary()
+    if not office_binary:
+        raise ValueError("未找到 LibreOffice/soffice，无法生成预览 PDF")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_root = Path(temp_dir)
+        temp_input = temp_root / source_path.name
+        shutil.copyfile(source_path, temp_input)
+
+        profile_dir = temp_root / "lo-profile"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            [
+                office_binary,
+                "--headless",
+                "--nologo",
+                "--nofirststartwizard",
+                f"-env:UserInstallation={profile_dir.as_uri()}",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                str(temp_root),
+                str(temp_input),
+            ],
+            check=False,
+            capture_output=True,
+            env={**os.environ, "HOME": str(temp_root)},
+            text=True,
+            timeout=180,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise ValueError(f"LibreOffice 生成预览 PDF 失败: {detail or result.returncode}")
+
+        converted_path = temp_input.with_suffix(".pdf")
+        if not converted_path.exists():
+            candidates = sorted(temp_root.glob("*.pdf"))
+            converted_path = candidates[0] if candidates else converted_path
+
+        if not converted_path.exists():
+            raise ValueError("LibreOffice 未生成预览 PDF")
+
+        shutil.copyfile(converted_path, output_path)
+
+
+def generate_preview_pdf(
+    source_path: Path,
+    output_path: Path,
+    content: dict[str, Any],
+) -> dict[str, Any]:
+    if _extension(source_path.name) == ".pdf":
+        return _copy_pdf_preview(source_path, output_path, content)
+
+    _convert_with_libreoffice_to_pdf(source_path, output_path)
+    return _update_preview_metadata(content, output_path)
 
 
 def _row_to_rag_file(row: Mapping[str, object]) -> RagFileRecord:
@@ -371,8 +701,9 @@ def _row_to_rag_file(row: Mapping[str, object]) -> RagFileRecord:
         size_bytes=int(row["size_bytes"] or 0),
         sha256=str(row["sha256"]),
         source_path=str(row["source_path"]),
-        markdown_path=str(row["markdown_path"]),
-        markdown_content=str(row.get("markdown_content") or ""),
+        content_json_path=str(row["content_json_path"]),
+        preview_pdf_path=str(row["preview_pdf_path"]),
+        content_json=str(row.get("content_json") or ""),
         status=str(row["status"]),
         error_message=(
             str(row["error_message"])
@@ -395,10 +726,12 @@ class RagFileService:
         )
         self.data_path = self._resolve_data_path()
         self.original_dir = self.data_path / "uploaded"
-        self.markdown_dir = self.data_path / "markdown"
+        self.content_dir = self.data_path / "content"
+        self.preview_dir = self.data_path / "preview"
         self.temp_dir = self.data_path / "tmp"
         self.original_dir.mkdir(parents=True, exist_ok=True)
-        self.markdown_dir.mkdir(parents=True, exist_ok=True)
+        self.content_dir.mkdir(parents=True, exist_ok=True)
+        self.preview_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self._initialize_database()
 
@@ -441,14 +774,16 @@ class RagFileService:
 
         existing = self.get_file_by_sha256(sha256, include_content=False)
         if existing is not None and existing.status in {
-            RAG_FILE_STATUS_CONVERTING,
+            RAG_FILE_STATUS_EXTRACTING,
+            RAG_FILE_STATUS_RENDERING,
             RAG_FILE_STATUS_INDEXING,
             RAG_FILE_STATUS_READY,
         }:
             return PreparedRagFile(record=existing, should_process=False)
 
         source_path = self.original_dir / f"{sha256}{extension}"
-        markdown_path = self.markdown_dir / f"{sha256}.md"
+        content_json_path = self.content_dir / f"{sha256}.json"
+        preview_pdf_path = self.preview_dir / f"{sha256}.pdf"
         size_bytes = uploaded_path.stat().st_size
 
         if not source_path.exists():
@@ -468,8 +803,9 @@ class RagFileService:
                 "size_bytes": size_bytes,
                 "sha256": sha256,
                 "source_path": _relative_project_path(source_path),
-                "markdown_path": _relative_project_path(markdown_path),
-                "markdown_content": "",
+                "content_json_path": _relative_project_path(content_json_path),
+                "preview_pdf_path": _relative_project_path(preview_pdf_path),
+                "content_json": "",
                 "status": RAG_FILE_STATUS_PENDING,
                 "error_message": None,
                 "now": now,
@@ -486,8 +822,9 @@ class RagFileService:
                             size_bytes,
                             sha256,
                             source_path,
-                            markdown_path,
-                            markdown_content,
+                            content_json_path,
+                            preview_pdf_path,
+                            content_json,
                             status,
                             error_message,
                             created_at,
@@ -500,8 +837,9 @@ class RagFileService:
                             :size_bytes,
                             :sha256,
                             :source_path,
-                            :markdown_path,
-                            :markdown_content,
+                            :content_json_path,
+                            :preview_pdf_path,
+                            :content_json,
                             :status,
                             :error_message,
                             :now,
@@ -524,8 +862,9 @@ class RagFileService:
                             mime_type = :mime_type,
                             size_bytes = :size_bytes,
                             source_path = :source_path,
-                            markdown_path = :markdown_path,
-                            markdown_content = :markdown_content,
+                            content_json_path = :content_json_path,
+                            preview_pdf_path = :preview_pdf_path,
+                            content_json = :content_json,
                             status = :status,
                             error_message = :error_message,
                             chunk_count = 0,
@@ -542,28 +881,44 @@ class RagFileService:
 
         return PreparedRagFile(record=record, should_process=True)
 
-    def convert_file_to_markdown_record(self, file_id: int) -> RagFileRecord:
+    def process_file_record(self, file_id: int) -> RagFileRecord:
         record = self.get_file(file_id, include_content=False)
         if record is None:
             raise FileNotFoundError("文件不存在")
 
         self.update_file_status(
             file_id,
-            RAG_FILE_STATUS_CONVERTING,
+            RAG_FILE_STATUS_EXTRACTING,
             error_message=None,
             chunk_count=0,
         )
 
         source_path = _resolve_project_path(record.source_path)
-        markdown_path = _resolve_project_path(record.markdown_path)
-        markdown_path.parent.mkdir(parents=True, exist_ok=True)
+        content_json_path = _resolve_project_path(record.content_json_path)
+        preview_pdf_path = _resolve_project_path(record.preview_pdf_path)
 
         try:
-            markdown_content = convert_file_to_markdown(source_path, record.original_name)
-            markdown_path.write_text(markdown_content, encoding="utf-8")
+            structured_content = extract_structured_content(
+                source_path,
+                record.original_name,
+                record.sha256,
+            )
+            self.update_file_status(file_id, RAG_FILE_STATUS_RENDERING)
+            structured_content = generate_preview_pdf(
+                source_path,
+                preview_pdf_path,
+                structured_content,
+            )
+
+            content_json = json.dumps(
+                structured_content,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            content_json_path.parent.mkdir(parents=True, exist_ok=True)
+            content_json_path.write_text(content_json, encoding="utf-8")
         except Exception as exc:
             error_message = str(exc)[:2000]
-            markdown_path.write_text("", encoding="utf-8")
             self.mark_file_failed(file_id, error_message)
             raise
 
@@ -574,7 +929,7 @@ class RagFileService:
                     """
                     UPDATE rag_files
                     SET
-                        markdown_content = :markdown_content,
+                        content_json = :content_json,
                         status = :status,
                         error_message = NULL,
                         chunk_count = 0,
@@ -584,20 +939,20 @@ class RagFileService:
                 ),
                 {
                     "file_id": file_id,
-                    "markdown_content": markdown_content,
+                    "content_json": content_json,
                     "status": RAG_FILE_STATUS_INDEXING,
                     "now": now,
                 },
             )
 
-        converted = self.get_file(file_id, include_content=True)
-        if converted is None:
+        processed = self.get_file(file_id, include_content=True)
+        if processed is None:
             raise FileNotFoundError("文件不存在")
 
-        return converted
+        return processed
 
     def list_files(self, include_content: bool = False) -> list[RagFileRecord]:
-        markdown_select = "markdown_content" if include_content else "'' AS markdown_content"
+        content_select = "content_json" if include_content else "'' AS content_json"
         with self._engine.connect() as connection:
             rows = connection.execute(
                 text(
@@ -610,43 +965,15 @@ class RagFileService:
                         size_bytes,
                         sha256,
                         source_path,
-                        markdown_path,
-                        {markdown_select},
+                        content_json_path,
+                        preview_pdf_path,
+                        {content_select},
                         status,
                         error_message,
                         chunk_count,
                         created_at,
                         updated_at
                     FROM rag_files
-                    ORDER BY updated_at DESC, id DESC
-                    """
-                )
-            ).mappings().fetchall()
-
-        return [_row_to_rag_file(row) for row in rows]
-
-    def list_ready_files(self) -> list[RagFileRecord]:
-        with self._engine.connect() as connection:
-            rows = connection.execute(
-                text(
-                    """
-                    SELECT
-                        id,
-                        original_name,
-                        original_extension,
-                        mime_type,
-                        size_bytes,
-                        sha256,
-                        source_path,
-                        markdown_path,
-                        markdown_content,
-                        status,
-                        error_message,
-                        chunk_count,
-                        created_at,
-                        updated_at
-                    FROM rag_files
-                    WHERE status = 'ready'
                     ORDER BY updated_at DESC, id DESC
                     """
                 )
@@ -667,8 +994,9 @@ class RagFileService:
                         size_bytes,
                         sha256,
                         source_path,
-                        markdown_path,
-                        markdown_content,
+                        content_json_path,
+                        preview_pdf_path,
+                        content_json,
                         status,
                         error_message,
                         chunk_count,
@@ -688,7 +1016,7 @@ class RagFileService:
         file_id: int,
         include_content: bool = True,
     ) -> RagFileRecord | None:
-        markdown_select = "markdown_content" if include_content else "'' AS markdown_content"
+        content_select = "content_json" if include_content else "'' AS content_json"
         with self._engine.connect() as connection:
             row = connection.execute(
                 text(
@@ -701,8 +1029,9 @@ class RagFileService:
                         size_bytes,
                         sha256,
                         source_path,
-                        markdown_path,
-                        {markdown_select},
+                        content_json_path,
+                        preview_pdf_path,
+                        {content_select},
                         status,
                         error_message,
                         chunk_count,
@@ -723,7 +1052,7 @@ class RagFileService:
         sha256: str,
         include_content: bool = True,
     ) -> RagFileRecord | None:
-        markdown_select = "markdown_content" if include_content else "'' AS markdown_content"
+        content_select = "content_json" if include_content else "'' AS content_json"
         with self._engine.connect() as connection:
             row = connection.execute(
                 text(
@@ -736,8 +1065,9 @@ class RagFileService:
                         size_bytes,
                         sha256,
                         source_path,
-                        markdown_path,
-                        {markdown_select},
+                        content_json_path,
+                        preview_pdf_path,
+                        {content_select},
                         status,
                         error_message,
                         chunk_count,
@@ -752,6 +1082,17 @@ class RagFileService:
             ).mappings().fetchone()
 
         return _row_to_rag_file(row) if row is not None else None
+
+    def get_preview_pdf_path(self, file_id: int) -> Path:
+        record = self.get_file(file_id, include_content=False)
+        if record is None:
+            raise FileNotFoundError("文件不存在")
+
+        path = _resolve_project_path(record.preview_pdf_path)
+        if not path.exists() or not path.is_file():
+            raise FileNotFoundError("文件预览尚未生成")
+
+        return path
 
     def update_chunk_count(self, file_id: int, chunk_count: int) -> None:
         with self._engine.begin() as connection:
@@ -884,7 +1225,11 @@ class RagFileService:
                 {"file_id": file_id},
             )
 
-        for path_value in (record.source_path, record.markdown_path):
+        for path_value in (
+            record.source_path,
+            record.content_json_path,
+            record.preview_pdf_path,
+        ):
             try:
                 path = _resolve_project_path(path_value)
             except ValueError:

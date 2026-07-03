@@ -305,6 +305,7 @@ def _normalize_rag_sources(
                 confidence=max(0, min(1, confidence)),
                 file_id=source.get("file_id"),
                 chunk_index=source.get("chunk_index"),
+                page_number=source.get("page_number"),
                 snippet=source.get("snippet"),
             )
         )
@@ -317,6 +318,7 @@ def _normalize_rag_source_payload(
     confidence: float,
     file_id: object = None,
     chunk_index: object = None,
+    page_number: object = None,
     snippet: object = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
@@ -331,6 +333,11 @@ def _normalize_rag_source_payload(
 
     try:
         payload["chunk_index"] = int(chunk_index)
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        payload["page_number"] = int(page_number)
     except (TypeError, ValueError):
         pass
 

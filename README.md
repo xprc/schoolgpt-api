@@ -35,7 +35,39 @@ sudo apt install -y python3 python3-venv python3-pip mysql-server nginx
 
 建议使用 Python 3.10、3.11 或 3.12。
 
-### 2. 准备 MySQL
+### 2. 安装 LibreOffice 与中文字体
+
+RAG 上传的 `doc`、`docx`、`txt`、`csv`、`xls`、`xlsx` 等非 PDF 文件会通过 LibreOffice headless 转成前端预览 PDF；上传的 `pdf` 会直接作为预览 PDF 使用。服务器必须安装 LibreOffice，否则非 PDF 文件会处理失败。
+
+Ubuntu 推荐安装 LibreOffice、Noto CJK 字体和字体缓存工具：
+
+```bash
+sudo apt install -y libreoffice libreoffice-writer libreoffice-calc fontconfig fonts-noto-cjk
+sudo fc-cache -fv
+```
+
+如果服务器镜像较精简，也可以同时安装文泉驿字体作为中文字体兜底：
+
+```bash
+sudo apt install -y fonts-wqy-zenhei
+sudo fc-cache -fv
+```
+
+安装后确认 `soffice` 可以在后端运行环境中访问：
+
+```bash
+soffice --headless --version
+```
+
+如果 `soffice` 不在 `PATH` 中，后端也会尝试查找常见 Windows LibreOffice 路径；Linux 部署建议直接把 `soffice` 加入服务运行用户的 `PATH`。安装 LibreOffice 或字体后建议重启后端服务：
+
+```bash
+sudo systemctl restart schoolgpt-api
+```
+
+已经生成失败或乱码预览的旧文件需要重新处理；旧的预览 PDF 不会因为安装 LibreOffice 或字体而自动修复。
+
+### 3. 准备 MySQL
 
 登录 MySQL：
 
@@ -53,7 +85,7 @@ FLUSH PRIVILEGES;
 
 首次运行设置会按页面填写的数据库名自动创建数据库和表。
 
-### 3. 安装后端依赖
+### 4. 安装后端依赖
 
 ```bash
 cd /opt/schoolgpt/schoolgpt-api
@@ -63,7 +95,7 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 4. 本地启动验证
+### 5. 本地启动验证
 
 ```bash
 cd /opt/schoolgpt/schoolgpt-api
@@ -81,7 +113,7 @@ uvicorn api.main:app --host 127.0.0.1 --port 8000
 export SCHOOLGPT_CORS_ORIGINS='["http://服务器IP"]'
 ```
 
-### 5. 使用 systemd 托管后端
+### 6. 使用 systemd 托管后端
 
 创建服务文件：
 
@@ -122,7 +154,7 @@ sudo systemctl status schoolgpt-api
 journalctl -u schoolgpt-api -f
 ```
 
-### 6. 配置 Nginx 反向代理
+### 7. 配置 Nginx 反向代理
 
 后端服务建议只监听 `127.0.0.1:8000`，由 Nginx 对外暴露 `/api/`：
 

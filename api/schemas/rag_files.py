@@ -14,6 +14,6 @@ class RagFileSummaryResponse(BaseModel):
 
 
 class RagFileDetailResponse(RagFileSummaryResponse):
-    markdown: str
     chunk_index: int | None = None
+    page_number: int | None = None
     snippet: str | None = None
