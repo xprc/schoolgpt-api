@@ -298,6 +298,7 @@ class VectorStoreService:
             "sha256": file_record.sha256,
             "status": file_record.status,
             "error_message": file_record.error_message,
+            "ocr_used": file_record.ocr_used,
             "indexed": file_record.status == "ready" and chunk_count > 0,
             "chunk_count": chunk_count,
         }

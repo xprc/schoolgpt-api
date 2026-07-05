@@ -5,7 +5,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -14,10 +14,12 @@ from typing import Any
 
 import pandas as pd
 import pdfplumber
+from PIL import Image
 from docx import Document as DocxDocument
 from sqlalchemy import create_engine, text
 
 from api.core.settings import PROJECT_ROOT, get_database_url
+from api.services.rag_ocr_service import extract_ocr_structured_content
 from utils.config_handler import chroma_conf
 from utils.file_handler import get_file_sha256_hex
 
@@ -36,6 +38,7 @@ CREATE TABLE IF NOT EXISTS rag_files (
     content_json LONGTEXT NOT NULL,
     status VARCHAR(16) NOT NULL DEFAULT 'pending',
     error_message TEXT NULL,
+    ocr_used BOOLEAN NOT NULL DEFAULT FALSE,
     chunk_count INT UNSIGNED NOT NULL DEFAULT 0,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
@@ -51,6 +54,9 @@ ALLOWED_RAG_UPLOAD_EXTENSIONS = (
     ".docx",
     ".txt",
     ".pdf",
+    ".png",
+    ".jpg",
+    ".jpeg",
     ".csv",
     ".xls",
     ".xlsx",
@@ -58,6 +64,7 @@ ALLOWED_RAG_UPLOAD_EXTENSIONS = (
 
 RAG_FILE_STATUS_PENDING = "pending"
 RAG_FILE_STATUS_EXTRACTING = "extracting"
+RAG_FILE_STATUS_OCR = "ocr"
 RAG_FILE_STATUS_RENDERING = "rendering"
 RAG_FILE_STATUS_INDEXING = "indexing"
 RAG_FILE_STATUS_READY = "ready"
@@ -69,6 +76,13 @@ RAG_FILE_INDEXABLE_STATUSES = (
 
 STRUCTURED_CONTENT_VERSION = 1
 TABLE_ROWS_PER_BLOCK = 24
+IMAGE_RAG_UPLOAD_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+PDF_RAG_UPLOAD_EXTENSION = ".pdf"
+IMAGE_PREVIEW_MEDIA_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+}
 
 
 @dataclass(frozen=True)
@@ -85,6 +99,7 @@ class RagFileRecord:
     content_json: str
     status: str
     error_message: str | None
+    ocr_used: bool
     chunk_count: int
     created_at: str
     updated_at: str
@@ -94,6 +109,18 @@ class RagFileRecord:
 class PreparedRagFile:
     record: RagFileRecord
     should_process: bool
+
+
+@dataclass(frozen=True)
+class ExtractionResult:
+    content: dict[str, Any]
+    ocr_used: bool
+
+
+@dataclass(frozen=True)
+class PreviewFile:
+    path: Path
+    media_type: str
 
 
 def _now_utc() -> datetime:
@@ -310,6 +337,11 @@ def structured_content_text_blocks(content_json: str) -> list[dict[str, Any]]:
         )
 
     return blocks
+
+
+def _structured_content_has_text(content: Mapping[str, Any]) -> bool:
+    serialized = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+    return bool(structured_content_text_blocks(serialized))
 
 
 def _paragraph_blocks_from_text(
@@ -583,8 +615,14 @@ def _pdf_to_structured_content(
     return _new_structured_content(original_name, extension, sha256, pages)
 
 
-def extract_structured_content(path: Path, original_name: str, sha256: str) -> dict[str, Any]:
+def extract_structured_content(
+    path: Path,
+    original_name: str,
+    sha256: str,
+    on_ocr_start: Callable[[], None] | None = None,
+) -> ExtractionResult:
     extension = _extension(original_name)
+    ocr_used = False
 
     if extension == ".txt":
         content = _text_to_structured_content(path, original_name, extension, sha256)
@@ -598,15 +636,33 @@ def extract_structured_content(path: Path, original_name: str, sha256: str) -> d
         content = _doc_to_structured_content(path, original_name, extension, sha256)
     elif extension == ".pdf":
         content = _pdf_to_structured_content(path, original_name, extension, sha256)
+        if not _structured_content_has_text(content):
+            if on_ocr_start:
+                on_ocr_start()
+            content = extract_ocr_structured_content(
+                path,
+                original_name,
+                extension,
+                sha256,
+            )
+            ocr_used = True
+    elif extension in IMAGE_RAG_UPLOAD_EXTENSIONS:
+        if on_ocr_start:
+            on_ocr_start()
+        content = extract_ocr_structured_content(
+            path,
+            original_name,
+            extension,
+            sha256,
+        )
+        ocr_used = True
     else:
         raise ValueError(f"不支持的文件类型: {extension}")
 
-    if not structured_content_text_blocks(
-        json.dumps(content, ensure_ascii=False, separators=(",", ":"))
-    ):
+    if not _structured_content_has_text(content):
         raise ValueError("文件未提取到可入库文本")
 
-    return content
+    return ExtractionResult(content=content, ocr_used=ocr_used)
 
 
 def _pdf_page_count(path: Path) -> int:
@@ -617,20 +673,57 @@ def _pdf_page_count(path: Path) -> int:
         return 0
 
 
-def _update_preview_metadata(content: dict[str, Any], preview_path: Path) -> dict[str, Any]:
+def _image_dimensions(path: Path) -> dict[str, int]:
+    try:
+        with Image.open(path) as image:
+            return {
+                "width": int(image.width),
+                "height": int(image.height),
+            }
+    except Exception:
+        return {}
+
+
+def _preview_format(extension: str) -> str:
+    return "image" if extension in IMAGE_RAG_UPLOAD_EXTENSIONS else "pdf"
+
+
+def _preview_page_count(preview_path: Path, preview_format: str) -> int:
+    if preview_format == "image":
+        return 1
+
+    return _pdf_page_count(preview_path)
+
+
+def _update_preview_metadata(
+    content: dict[str, Any],
+    preview_path: Path,
+    preview_format: str,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "page_count": _preview_page_count(preview_path, preview_format),
+        "format": preview_format,
+    }
+    if preview_format == "image":
+        metadata.update(_image_dimensions(preview_path))
+
     content["preview"] = {
-        "page_count": _pdf_page_count(preview_path),
-        "format": "pdf",
+        **metadata,
     }
     return content
 
 
-def _copy_pdf_preview(source_path: Path, output_path: Path, content: dict[str, Any]) -> dict[str, Any]:
+def _copy_preview_file(
+    source_path: Path,
+    output_path: Path,
+    content: dict[str, Any],
+    preview_format: str,
+) -> dict[str, Any]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if source_path.resolve() != output_path.resolve():
         shutil.copyfile(source_path, output_path)
 
-    return _update_preview_metadata(content, output_path)
+    return _update_preview_metadata(content, output_path, preview_format)
 
 
 def _convert_with_libreoffice_to_pdf(source_path: Path, output_path: Path) -> None:
@@ -680,16 +773,19 @@ def _convert_with_libreoffice_to_pdf(source_path: Path, output_path: Path) -> No
         shutil.copyfile(converted_path, output_path)
 
 
-def generate_preview_pdf(
+def generate_preview_file(
     source_path: Path,
     output_path: Path,
     content: dict[str, Any],
 ) -> dict[str, Any]:
-    if _extension(source_path.name) == ".pdf":
-        return _copy_pdf_preview(source_path, output_path, content)
+    extension = _extension(source_path.name)
+    preview_format = _preview_format(extension)
+
+    if extension == PDF_RAG_UPLOAD_EXTENSION or extension in IMAGE_RAG_UPLOAD_EXTENSIONS:
+        return _copy_preview_file(source_path, output_path, content, preview_format)
 
     _convert_with_libreoffice_to_pdf(source_path, output_path)
-    return _update_preview_metadata(content, output_path)
+    return _update_preview_metadata(content, output_path, "pdf")
 
 
 def _row_to_rag_file(row: Mapping[str, object]) -> RagFileRecord:
@@ -710,6 +806,7 @@ def _row_to_rag_file(row: Mapping[str, object]) -> RagFileRecord:
             if row.get("error_message") is not None
             else None
         ),
+        ocr_used=bool(row.get("ocr_used")),
         chunk_count=int(row["chunk_count"] or 0),
         created_at=_isoformat(row["created_at"]),
         updated_at=_isoformat(row["updated_at"]),
@@ -783,7 +880,8 @@ class RagFileService:
 
         source_path = self.original_dir / f"{sha256}{extension}"
         content_json_path = self.content_dir / f"{sha256}.json"
-        preview_pdf_path = self.preview_dir / f"{sha256}.pdf"
+        preview_extension = extension if extension in IMAGE_RAG_UPLOAD_EXTENSIONS else ".pdf"
+        preview_pdf_path = self.preview_dir / f"{sha256}{preview_extension}"
         size_bytes = uploaded_path.stat().st_size
 
         if not source_path.exists():
@@ -808,6 +906,7 @@ class RagFileService:
                 "content_json": "",
                 "status": RAG_FILE_STATUS_PENDING,
                 "error_message": None,
+                "ocr_used": False,
                 "now": now,
             }
 
@@ -827,6 +926,7 @@ class RagFileService:
                             content_json,
                             status,
                             error_message,
+                            ocr_used,
                             created_at,
                             updated_at
                         )
@@ -842,6 +942,7 @@ class RagFileService:
                             :content_json,
                             :status,
                             :error_message,
+                            :ocr_used,
                             :now,
                             :now
                         )
@@ -867,6 +968,7 @@ class RagFileService:
                             content_json = :content_json,
                             status = :status,
                             error_message = :error_message,
+                            ocr_used = :ocr_used,
                             chunk_count = 0,
                             updated_at = :now
                         WHERE id = :file_id
@@ -898,13 +1000,19 @@ class RagFileService:
         preview_pdf_path = _resolve_project_path(record.preview_pdf_path)
 
         try:
-            structured_content = extract_structured_content(
+            extraction_result = extract_structured_content(
                 source_path,
                 record.original_name,
                 record.sha256,
+                on_ocr_start=lambda: self.update_file_status(
+                    file_id,
+                    RAG_FILE_STATUS_OCR,
+                    error_message=None,
+                ),
             )
+            structured_content = extraction_result.content
             self.update_file_status(file_id, RAG_FILE_STATUS_RENDERING)
-            structured_content = generate_preview_pdf(
+            structured_content = generate_preview_file(
                 source_path,
                 preview_pdf_path,
                 structured_content,
@@ -932,6 +1040,7 @@ class RagFileService:
                         content_json = :content_json,
                         status = :status,
                         error_message = NULL,
+                        ocr_used = :ocr_used,
                         chunk_count = 0,
                         updated_at = :now
                     WHERE id = :file_id
@@ -941,6 +1050,7 @@ class RagFileService:
                     "file_id": file_id,
                     "content_json": content_json,
                     "status": RAG_FILE_STATUS_INDEXING,
+                    "ocr_used": extraction_result.ocr_used,
                     "now": now,
                 },
             )
@@ -970,6 +1080,7 @@ class RagFileService:
                         {content_select},
                         status,
                         error_message,
+                        ocr_used,
                         chunk_count,
                         created_at,
                         updated_at
@@ -999,6 +1110,7 @@ class RagFileService:
                         content_json,
                         status,
                         error_message,
+                        ocr_used,
                         chunk_count,
                         created_at,
                         updated_at
@@ -1034,6 +1146,7 @@ class RagFileService:
                         {content_select},
                         status,
                         error_message,
+                        ocr_used,
                         chunk_count,
                         created_at,
                         updated_at
@@ -1070,6 +1183,7 @@ class RagFileService:
                         {content_select},
                         status,
                         error_message,
+                        ocr_used,
                         chunk_count,
                         created_at,
                         updated_at
@@ -1083,7 +1197,7 @@ class RagFileService:
 
         return _row_to_rag_file(row) if row is not None else None
 
-    def get_preview_pdf_path(self, file_id: int) -> Path:
+    def get_preview_file(self, file_id: int) -> PreviewFile:
         record = self.get_file(file_id, include_content=False)
         if record is None:
             raise FileNotFoundError("文件不存在")
@@ -1092,7 +1206,14 @@ class RagFileService:
         if not path.exists() or not path.is_file():
             raise FileNotFoundError("文件预览尚未生成")
 
-        return path
+        extension = _extension(path.name)
+        return PreviewFile(
+            path=path,
+            media_type=IMAGE_PREVIEW_MEDIA_TYPES.get(extension, "application/pdf"),
+        )
+
+    def get_preview_pdf_path(self, file_id: int) -> Path:
+        return self.get_preview_file(file_id).path
 
     def update_chunk_count(self, file_id: int, chunk_count: int) -> None:
         with self._engine.begin() as connection:

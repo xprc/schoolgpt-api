@@ -77,7 +77,7 @@ async def get_rag_file_preview(
     service: RagFileService = Depends(get_rag_file_service),
 ) -> FileResponse:
     try:
-        preview_path = service.get_preview_pdf_path(file_id)
+        preview_file = service.get_preview_file(file_id)
     except FileNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -85,7 +85,7 @@ async def get_rag_file_preview(
         ) from exc
 
     return FileResponse(
-        preview_path,
-        media_type="application/pdf",
-        filename=preview_path.name,
+        preview_file.path,
+        media_type=preview_file.media_type,
+        filename=preview_file.path.name,
     )

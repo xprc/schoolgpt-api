@@ -118,6 +118,8 @@ ormsgpack==1.12.2
 overrides==7.7.0
 packaging==26.0
 pandas==2.3.3
+paddleocr[doc-parser]>=3.7.0,<3.8.0
+paddlepaddle>=3.0.0
 parso==0.8.6
 pdfminer.six==20251230
 pdfplumber==0.11.9

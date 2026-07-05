@@ -6,7 +6,7 @@ score_threshold: 0.25  # 余弦相似度低于此值的片段直接过滤
 filter: null             # 可按 metadata 过滤，如 {"source": "doc1.pdf"}
 data_path: data
 
-allow_knowledge_file_type: ["doc", "docx", "txt", "pdf", "csv", "xls", "xlsx"]
+allow_knowledge_file_type: ["doc", "docx", "txt", "pdf", "png", "jpg", "jpeg", "csv", "xls", "xlsx"]
 
 chunk_size: 200
 chunk_overlap: 40

@@ -106,7 +106,7 @@ class WebSearchConfigUpdateRequest(BaseModel):
 
 
 class RagKnowledgeFileResponse(RagFileSummaryResponse):
-    pass
+    ocr_used: bool = False
 
 
 class RagStatusResponse(BaseModel):
