@@ -19,7 +19,7 @@ build==1.4.2
 cachetools==7.0.5
 certifi==2026.2.25
 cffi==2.0.0
-charset-normalizer==3.4.5
+charset-normalizer==3.4.7
 chatollama==0.2.13
 chromadb==1.5.5
 click==8.3.1
