@@ -152,6 +152,7 @@ activemq-data/
 .envrc
 config/runtime_setup.json
 md5.text
+chroma_db/
 agent/chroma_db/
 rag/chroma_db/
 .venv
