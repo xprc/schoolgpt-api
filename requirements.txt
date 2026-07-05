@@ -139,7 +139,7 @@ pydub==0.25.1
 Pygments==2.19.2
 PyMySQL==1.1.1
 pypdf==6.9.2
-pypdfium2==5.7.0
+pypdfium2==5.11.0
 PyPika==0.51.1
 pyproject_hooks==1.2.0
 python-dateutil==2.9.0.post0
