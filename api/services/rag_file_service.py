@@ -16,38 +16,15 @@ import pandas as pd
 import pdfplumber
 from PIL import Image
 from docx import Document as DocxDocument
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
-from api.core.settings import PROJECT_ROOT, get_database_url
+from api.core.settings import PROJECT_ROOT
+from api.db.core import Database
+from api.db.schema import create_schema
 from api.services.rag_ocr_service import extract_ocr_structured_content
 from utils.config_handler import chroma_conf
 from utils.file_handler import get_file_sha256_hex
 
-
-CREATE_RAG_FILES_SQL = """
-CREATE TABLE IF NOT EXISTS rag_files (
-    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    original_name VARCHAR(255) NOT NULL,
-    original_extension VARCHAR(16) NOT NULL,
-    mime_type VARCHAR(255) NOT NULL DEFAULT '',
-    size_bytes BIGINT UNSIGNED NOT NULL,
-    sha256 CHAR(64) NOT NULL,
-    source_path VARCHAR(512) NOT NULL,
-    content_json_path VARCHAR(512) NOT NULL,
-    preview_pdf_path VARCHAR(512) NOT NULL,
-    content_json LONGTEXT NOT NULL,
-    status VARCHAR(16) NOT NULL DEFAULT 'pending',
-    error_message TEXT NULL,
-    ocr_used BOOLEAN NOT NULL DEFAULT FALSE,
-    chunk_count INT UNSIGNED NOT NULL DEFAULT 0,
-    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-    PRIMARY KEY (id),
-    UNIQUE KEY uq_rag_files_sha256 (sha256),
-    KEY idx_rag_files_status_updated (status, updated_at),
-    KEY idx_rag_files_name (original_name)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-"""
 
 ALLOWED_RAG_UPLOAD_EXTENSIONS = (
     ".doc",
@@ -815,12 +792,7 @@ def _row_to_rag_file(row: Mapping[str, object]) -> RagFileRecord:
 
 class RagFileService:
     def __init__(self) -> None:
-        self._engine = create_engine(
-            get_database_url(),
-            pool_pre_ping=True,
-            pool_recycle=1800,
-            future=True,
-        )
+        self._db = Database()
         self.data_path = self._resolve_data_path()
         self.original_dir = self.data_path / "uploaded"
         self.content_dir = self.data_path / "content"
@@ -846,8 +818,8 @@ class RagFileService:
         return (PROJECT_ROOT / path).resolve()
 
     def _initialize_database(self) -> None:
-        with self._engine.begin() as connection:
-            connection.execute(text(CREATE_RAG_FILES_SQL))
+        with self._db.begin() as connection:
+            create_schema(connection, ("rag_files",))
 
     def create_temp_upload_path(self, filename: str) -> Path:
         safe_name = _safe_original_name(filename)
@@ -888,7 +860,7 @@ class RagFileService:
             shutil.copyfile(uploaded_path, source_path)
 
         now = _now_utc()
-        with self._engine.begin() as connection:
+        with self._db.begin() as connection:
             row = connection.execute(
                 text("SELECT id FROM rag_files WHERE sha256 = :sha256 LIMIT 1"),
                 {"sha256": sha256},
@@ -1031,7 +1003,7 @@ class RagFileService:
             raise
 
         now = _now_utc()
-        with self._engine.begin() as connection:
+        with self._db.begin() as connection:
             connection.execute(
                 text(
                     """
@@ -1063,7 +1035,7 @@ class RagFileService:
 
     def list_files(self, include_content: bool = False) -> list[RagFileRecord]:
         content_select = "content_json" if include_content else "'' AS content_json"
-        with self._engine.connect() as connection:
+        with self._db.connect() as connection:
             rows = connection.execute(
                 text(
                     f"""
@@ -1093,7 +1065,7 @@ class RagFileService:
         return [_row_to_rag_file(row) for row in rows]
 
     def list_indexable_files(self) -> list[RagFileRecord]:
-        with self._engine.connect() as connection:
+        with self._db.connect() as connection:
             rows = connection.execute(
                 text(
                     """
@@ -1129,7 +1101,7 @@ class RagFileService:
         include_content: bool = True,
     ) -> RagFileRecord | None:
         content_select = "content_json" if include_content else "'' AS content_json"
-        with self._engine.connect() as connection:
+        with self._db.connect() as connection:
             row = connection.execute(
                 text(
                     f"""
@@ -1166,7 +1138,7 @@ class RagFileService:
         include_content: bool = True,
     ) -> RagFileRecord | None:
         content_select = "content_json" if include_content else "'' AS content_json"
-        with self._engine.connect() as connection:
+        with self._db.connect() as connection:
             row = connection.execute(
                 text(
                     f"""
@@ -1216,7 +1188,7 @@ class RagFileService:
         return self.get_preview_file(file_id).path
 
     def update_chunk_count(self, file_id: int, chunk_count: int) -> None:
-        with self._engine.begin() as connection:
+        with self._db.begin() as connection:
             connection.execute(
                 text(
                     """
@@ -1254,7 +1226,7 @@ class RagFileService:
             assignments.append("chunk_count = :chunk_count")
             payload["chunk_count"] = max(0, int(chunk_count))
 
-        with self._engine.begin() as connection:
+        with self._db.begin() as connection:
             connection.execute(
                 text(
                     f"""
@@ -1320,7 +1292,7 @@ class RagFileService:
             }
         )
 
-        with self._engine.begin() as connection:
+        with self._db.begin() as connection:
             connection.execute(
                 text(
                     f"""
@@ -1340,7 +1312,7 @@ class RagFileService:
         if record is None:
             raise FileNotFoundError("文件不存在")
 
-        with self._engine.begin() as connection:
+        with self._db.begin() as connection:
             connection.execute(
                 text("DELETE FROM rag_files WHERE id = :file_id"),
                 {"file_id": file_id},

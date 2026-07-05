@@ -3,43 +3,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Connection
-from sqlalchemy.engine.url import make_url
+from sqlalchemy import text
 
-from api.core.settings import get_database_url
-
-
-CREATE_MODEL_CONFIGS_SQL = """
-CREATE TABLE IF NOT EXISTS model_configs (
-    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    provider VARCHAR(32) NOT NULL,
-    model_name VARCHAR(120) NOT NULL,
-    base_url VARCHAR(255) NOT NULL,
-    api_path VARCHAR(120) NOT NULL DEFAULT '/chat/completions',
-    api_key VARCHAR(512) NOT NULL DEFAULT '',
-    is_active TINYINT(1) NOT NULL DEFAULT 1,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    PRIMARY KEY (id),
-    KEY idx_model_configs_active_updated (is_active, updated_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-"""
-
-MODEL_PROVIDER_DEFAULTS: dict[str, dict[str, object]] = {
-    "deepseek": {
-        "label": "DeepSeek",
-        "base_url": "https://api.deepseek.com",
-        "api_path": "/chat/completions",
-        "models": ("deepseek-v4-pro", "deepseek-v4-flash"),
-    },
-    "qwen": {
-        "label": "通义千问",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "api_path": "/chat/completions",
-        "models": ("qwen-plus", "qwen-max", "qwen-turbo"),
-    },
-}
+from api.db.core import Database
+from api.db.defaults import MODEL_PROVIDER_DEFAULTS
+from api.db.schema import create_schema
+from api.db.seeds import ensure_default_model_config
 
 
 @dataclass(frozen=True)
@@ -67,10 +36,6 @@ class ModelProviderOption:
     base_url: str
     api_path: str
     models: tuple[str, ...]
-
-
-def _quote_mysql_identifier(identifier: str) -> str:
-    return "`" + identifier.replace("`", "``") + "`"
 
 
 def _isoformat(value: object) -> str:
@@ -111,114 +76,13 @@ def _row_to_model_config(row: Mapping[str, object]) -> ModelConfig:
 
 class ModelConfigService:
     def __init__(self) -> None:
-        database_url = get_database_url()
-        self._ensure_mysql_database(database_url)
-        self._engine = create_engine(
-            database_url,
-            pool_pre_ping=True,
-            pool_recycle=1800,
-            future=True,
-        )
+        self._db = Database()
         self._initialize_database()
 
-    def _ensure_mysql_database(self, database_url: str) -> None:
-        url = make_url(database_url)
-        if not url.drivername.startswith("mysql") or not url.database:
-            return
-
-        server_engine = create_engine(
-            url.set(database=None),
-            pool_pre_ping=True,
-            future=True,
-        )
-
-        try:
-            with server_engine.begin() as connection:
-                connection.execute(
-                    text(
-                        "CREATE DATABASE IF NOT EXISTS "
-                        f"{_quote_mysql_identifier(url.database)} "
-                        "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
-                    )
-                )
-        finally:
-            server_engine.dispose()
-
     def _initialize_database(self) -> None:
-        with self._engine.begin() as connection:
-            connection.execute(text(CREATE_MODEL_CONFIGS_SQL))
-            self._ensure_default_config(connection)
-
-    def _mysql_column_exists(
-        self,
-        connection: Connection,
-        table_name: str,
-        column_name: str,
-    ) -> bool:
-        if self._engine.dialect.name != "mysql":
-            return True
-
-        count = connection.execute(
-            text(
-                """
-                SELECT COUNT(*)
-                FROM INFORMATION_SCHEMA.COLUMNS
-                WHERE TABLE_SCHEMA = DATABASE()
-                    AND TABLE_NAME = :table_name
-                    AND COLUMN_NAME = :column_name
-                """
-            ),
-            {"table_name": table_name, "column_name": column_name},
-        ).scalar_one()
-
-        return int(count) > 0
-
-    def _ensure_api_path_column(self, connection: Connection) -> None:
-        if self._mysql_column_exists(connection, "model_configs", "api_path"):
-            return
-
-        connection.execute(
-            text(
-                """
-                ALTER TABLE model_configs
-                ADD COLUMN api_path VARCHAR(120) NOT NULL DEFAULT '/chat/completions' AFTER base_url
-                """
-            )
-        )
-
-    def _ensure_default_config(self, connection: Connection) -> None:
-        count = connection.execute(text("SELECT COUNT(*) FROM model_configs")).scalar_one()
-        if int(count) > 0:
-            return
-
-        defaults = MODEL_PROVIDER_DEFAULTS["deepseek"]
-        connection.execute(
-            text(
-                """
-                INSERT INTO model_configs (
-                    provider,
-                    model_name,
-                    base_url,
-                    api_path,
-                    api_key,
-                    is_active
-                )
-                VALUES (
-                    'deepseek',
-                    :model_name,
-                    :base_url,
-                    :api_path,
-                    '',
-                    TRUE
-                )
-                """
-            ),
-            {
-                "model_name": str(defaults["models"][0]),
-                "base_url": str(defaults["base_url"]),
-                "api_path": str(defaults["api_path"]),
-            },
-        )
+        with self._db.begin() as connection:
+            create_schema(connection, ("model_configs",))
+            ensure_default_model_config(connection)
 
     def get_provider_options(self) -> list[ModelProviderOption]:
         return [
@@ -233,7 +97,7 @@ class ModelConfigService:
         ]
 
     def get_active_model_config(self) -> ModelConfig:
-        with self._engine.connect() as connection:
+        with self._db.connect() as connection:
             row = connection.execute(
                 text(
                     """
@@ -283,7 +147,7 @@ class ModelConfigService:
         if not normalized_api_path.startswith("/"):
             raise ValueError("API path must start with /")
 
-        with self._engine.begin() as connection:
+        with self._db.begin() as connection:
             row = connection.execute(
                 text(
                     """

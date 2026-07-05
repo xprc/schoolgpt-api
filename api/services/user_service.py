@@ -5,35 +5,11 @@ from functools import lru_cache
 from hashlib import sha256
 
 import bcrypt
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import Connection
-from sqlalchemy.engine.url import make_url
 
-from api.core.settings import get_database_url
-
-
-CREATE_USERS_SQL = """
-CREATE TABLE IF NOT EXISTS users (
-    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    username VARCHAR(64) NOT NULL,
-    email VARCHAR(120) NOT NULL,
-    avatar_sha256 CHAR(64) NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
-    display_name VARCHAR(120) NOT NULL,
-    user_type VARCHAR(16) NOT NULL DEFAULT 'student',
-    preferred_language VARCHAR(16) NOT NULL DEFAULT 'zh',
-    light_background VARCHAR(255) NOT NULL DEFAULT '/backgrounds/light-1.jpg',
-    dark_background VARCHAR(255) NOT NULL DEFAULT '/backgrounds/dark-1.jpg',
-    is_active TINYINT(1) NOT NULL DEFAULT 1,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    last_login_at TIMESTAMP NULL DEFAULT NULL,
-    PRIMARY KEY (id),
-    UNIQUE KEY uq_users_username (username),
-    UNIQUE KEY uq_users_email (email),
-    UNIQUE KEY uq_users_avatar_sha256 (avatar_sha256)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-"""
+from api.db.core import Database, mysql_column_exists, mysql_index_exists
+from api.db.schema import create_schema
 
 VALID_USER_TYPES = {"student", "teacher", "maintenance", "admin"}
 VALID_PREFERRED_LANGUAGES = {"en", "zh"}
@@ -93,10 +69,6 @@ def _verify_password(password: str, password_hash: str) -> bool:
 def _email_to_avatar_sha256(email: str) -> str:
     normalized_email = email.strip().lower()
     return sha256(normalized_email.encode("utf-8")).hexdigest()
-
-
-def _quote_mysql_identifier(identifier: str) -> str:
-    return "`" + identifier.replace("`", "``") + "`"
 
 
 def _isoformat(value: object) -> str:
@@ -178,82 +150,22 @@ def _row_to_admin_user(row: Mapping[str, object]) -> AdminUser:
 
 class UserService:
     def __init__(self) -> None:
-        database_url = get_database_url()
-        self._ensure_mysql_database(database_url)
-        self._engine = create_engine(
-            database_url,
-            pool_pre_ping=True,
-            pool_recycle=1800,
-            future=True,
-        )
+        self._db = Database()
         self._initialize_database()
 
-    def _ensure_mysql_database(self, database_url: str) -> None:
-        url = make_url(database_url)
-        if not url.drivername.startswith("mysql") or not url.database:
-            return
-
-        server_engine = create_engine(
-            url.set(database=None),
-            pool_pre_ping=True,
-            future=True,
-        )
-
-        try:
-            with server_engine.begin() as connection:
-                connection.execute(
-                    text(
-                        "CREATE DATABASE IF NOT EXISTS "
-                        f"{_quote_mysql_identifier(url.database)} "
-                        "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
-                    )
-                )
-        finally:
-            server_engine.dispose()
-
     def _initialize_database(self) -> None:
-        with self._engine.begin() as connection:
-            connection.execute(text(CREATE_USERS_SQL))
+        with self._db.begin() as connection:
+            create_schema(connection, ("users",))
             self._ensure_user_preference_columns(connection)
 
     def _mysql_column_exists(self, connection: Connection, column_name: str) -> bool:
-        if self._engine.dialect.name != "mysql":
-            return True
-
-        count = connection.execute(
-            text(
-                """
-                SELECT COUNT(*)
-                FROM information_schema.COLUMNS
-                WHERE TABLE_SCHEMA = DATABASE()
-                    AND TABLE_NAME = 'users'
-                    AND COLUMN_NAME = :column_name
-                """
-            ),
-            {"column_name": column_name},
-        ).scalar_one()
-        return int(count) > 0
+        return mysql_column_exists(connection, self._db.dialect_name, "users", column_name)
 
     def _mysql_index_exists(self, connection: Connection, index_name: str) -> bool:
-        if self._engine.dialect.name != "mysql":
-            return True
-
-        count = connection.execute(
-            text(
-                """
-                SELECT COUNT(*)
-                FROM information_schema.STATISTICS
-                WHERE TABLE_SCHEMA = DATABASE()
-                    AND TABLE_NAME = 'users'
-                    AND INDEX_NAME = :index_name
-                """
-            ),
-            {"index_name": index_name},
-        ).scalar_one()
-        return int(count) > 0
+        return mysql_index_exists(connection, self._db.dialect_name, "users", index_name)
 
     def _ensure_avatar_sha256_column(self, connection: Connection) -> None:
-        if self._engine.dialect.name != "mysql":
+        if self._db.dialect_name != "mysql":
             return
 
         if not self._mysql_column_exists(connection, "avatar_sha256"):
@@ -267,7 +179,7 @@ class UserService:
             )
 
     def _ensure_avatar_sha256_index(self, connection: Connection) -> None:
-        if self._engine.dialect.name != "mysql":
+        if self._db.dialect_name != "mysql":
             return
 
         if not self._mysql_index_exists(connection, "uq_users_avatar_sha256"):
@@ -281,7 +193,7 @@ class UserService:
             )
 
     def _ensure_user_type_column(self, connection: Connection) -> None:
-        if self._engine.dialect.name != "mysql":
+        if self._db.dialect_name != "mysql":
             return
 
         if not self._mysql_column_exists(connection, "user_type"):
@@ -305,7 +217,7 @@ class UserService:
         )
 
     def _ensure_user_preference_columns(self, connection: Connection) -> None:
-        if self._engine.dialect.name != "mysql":
+        if self._db.dialect_name != "mysql":
             return
 
         if not self._mysql_column_exists(connection, "preferred_language"):
@@ -363,7 +275,7 @@ class UserService:
         )
 
     def _backfill_avatar_sha256(self, connection: Connection) -> None:
-        if self._engine.dialect.name != "mysql":
+        if self._db.dialect_name != "mysql":
             return
 
         connection.execute(
@@ -396,7 +308,7 @@ class UserService:
         avatar_sha256 = _email_to_avatar_sha256(email)
         normalized_user_type = _normalize_user_type(user_type)
 
-        with self._engine.begin() as connection:
+        with self._db.begin() as connection:
             cursor = connection.execute(
                 text(
                     """
@@ -440,7 +352,7 @@ class UserService:
         if not normalized_identifier or not password:
             return None
 
-        with self._engine.begin() as connection:
+        with self._db.begin() as connection:
             row = connection.execute(
                 text(
                     """
@@ -484,7 +396,7 @@ class UserService:
             return _row_to_user(row)
 
     def get_user_by_id(self, user_id: int) -> User | None:
-        with self._engine.connect() as connection:
+        with self._db.connect() as connection:
             row = connection.execute(
                 text(
                     """
@@ -530,7 +442,7 @@ class UserService:
             DEFAULT_DARK_BACKGROUND,
         )
 
-        with self._engine.begin() as connection:
+        with self._db.begin() as connection:
             result = connection.execute(
                 text(
                     """
@@ -555,7 +467,7 @@ class UserService:
         return self.get_user_by_id(user_id)
 
     def list_admin_users(self) -> list[AdminUser]:
-        with self._engine.connect() as connection:
+        with self._db.connect() as connection:
             rows = connection.execute(
                 text(
                     """
@@ -610,7 +522,7 @@ class UserService:
         return admin_user
 
     def get_admin_user_by_id(self, user_id: int) -> AdminUser | None:
-        with self._engine.connect() as connection:
+        with self._db.connect() as connection:
             row = connection.execute(
                 text(
                     """
@@ -649,7 +561,7 @@ class UserService:
         normalized_user_type = _normalize_user_type(user_type)
         avatar_sha256 = _email_to_avatar_sha256(email)
 
-        with self._engine.begin() as connection:
+        with self._db.begin() as connection:
             result = connection.execute(
                 text(
                     """
@@ -681,7 +593,7 @@ class UserService:
 
     def update_admin_user_password(self, user_id: int, password: str) -> bool:
         password_hash = _hash_password(password)
-        with self._engine.begin() as connection:
+        with self._db.begin() as connection:
             result = connection.execute(
                 text(
                     """
@@ -697,7 +609,7 @@ class UserService:
         return result.rowcount > 0
 
     def get_user_type_counts(self) -> dict[str, int]:
-        with self._engine.connect() as connection:
+        with self._db.connect() as connection:
             rows = connection.execute(
                 text(
                     """
@@ -715,7 +627,7 @@ class UserService:
         return counts
 
     def get_user_totals(self) -> dict[str, int]:
-        with self._engine.connect() as connection:
+        with self._db.connect() as connection:
             row = connection.execute(
                 text(
                     """
