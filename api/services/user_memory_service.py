@@ -4,12 +4,11 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from uuid import UUID, uuid4
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import Connection
-from sqlalchemy.engine.url import make_url
 
-from api.core.settings import get_database_url
-from api.services.user_service import CREATE_USERS_SQL
+from api.db.core import get_database_engine
+from api.db.schema import initialize_user_memories_schema
 
 
 MAX_MEMORY_CONTENT_LENGTH = 4000
@@ -35,22 +34,6 @@ DEFAULT_IDENTITY_MEMORY_CONTENT: dict[str, str] = {
     ),
 }
 
-CREATE_USER_MEMORIES_SQL = """
-CREATE TABLE IF NOT EXISTS user_memories (
-    id CHAR(36) NOT NULL,
-    user_id BIGINT UNSIGNED NOT NULL,
-    content TEXT NOT NULL,
-    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-    PRIMARY KEY (id),
-    KEY idx_user_memories_user_updated (user_id, updated_at),
-    CONSTRAINT fk_user_memories_user
-        FOREIGN KEY (user_id) REFERENCES users(id)
-        ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-"""
-
-
 @dataclass(frozen=True)
 class UserMemory:
     id: str
@@ -58,10 +41,6 @@ class UserMemory:
     content: str
     created_at: str
     updated_at: str
-
-
-def _quote_mysql_identifier(identifier: str) -> str:
-    return "`" + identifier.replace("`", "``") + "`"
 
 
 def _ensure_uuid(value: str | None) -> str:
@@ -144,43 +123,8 @@ def _memory_match_score(memory: UserMemory, query: str) -> float:
 
 class UserMemoryService:
     def __init__(self) -> None:
-        database_url = get_database_url()
-        self._ensure_mysql_database(database_url)
-        self._engine = create_engine(
-            database_url,
-            pool_pre_ping=True,
-            pool_recycle=1800,
-            future=True,
-        )
-        self._initialize_database()
-
-    def _ensure_mysql_database(self, database_url: str) -> None:
-        url = make_url(database_url)
-        if not url.drivername.startswith("mysql") or not url.database:
-            return
-
-        server_engine = create_engine(
-            url.set(database=None),
-            pool_pre_ping=True,
-            future=True,
-        )
-
-        try:
-            with server_engine.begin() as connection:
-                connection.execute(
-                    text(
-                        "CREATE DATABASE IF NOT EXISTS "
-                        f"{_quote_mysql_identifier(url.database)} "
-                        "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
-                    )
-                )
-        finally:
-            server_engine.dispose()
-
-    def _initialize_database(self) -> None:
-        with self._engine.begin() as connection:
-            connection.execute(text(CREATE_USERS_SQL))
-            connection.execute(text(CREATE_USER_MEMORIES_SQL))
+        self._engine = get_database_engine()
+        initialize_user_memories_schema(self._engine)
 
     def _get_memory_row(
         self,

@@ -9,27 +9,16 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
-from api.core.settings import get_database_url
+from api.db.core import get_database_engine
+from api.db.defaults import (
+    PADDLE_OCR_MODEL,
+    PADDLE_OCR_PROVIDER,
+    PADDLE_OCR_PROVIDER_LABEL,
+)
+from api.db.schema import initialize_paddle_ocr_configs_schema
 
-
-CREATE_PADDLE_OCR_CONFIGS_SQL = """
-CREATE TABLE IF NOT EXISTS paddle_ocr_configs (
-    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    provider VARCHAR(32) NOT NULL DEFAULT 'baidu_aistudio',
-    api_key VARCHAR(1024) NOT NULL DEFAULT '',
-    model_name VARCHAR(64) NOT NULL DEFAULT 'PaddleOCR-VL-1.5',
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    PRIMARY KEY (id),
-    UNIQUE KEY uq_paddle_ocr_configs_provider (provider)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-"""
-
-PADDLE_OCR_PROVIDER = "baidu_aistudio"
-PADDLE_OCR_PROVIDER_LABEL = "百度 AI Studio PaddleOCR"
-PADDLE_OCR_MODEL = "PaddleOCR-VL-1.5"
 PADDLE_OCR_JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
 PADDLE_OCR_LOCAL_FILE_LIMIT = 50 * 1024 * 1024
 
@@ -71,32 +60,8 @@ def _row_to_config(row: Mapping[str, object]) -> PaddleOcrConfig:
 
 class PaddleOcrConfigService:
     def __init__(self) -> None:
-        self._engine = create_engine(
-            get_database_url(),
-            pool_pre_ping=True,
-            pool_recycle=1800,
-            future=True,
-        )
-        self._initialize_database()
-
-    def _initialize_database(self) -> None:
-        with self._engine.begin() as connection:
-            connection.execute(text(CREATE_PADDLE_OCR_CONFIGS_SQL))
-            connection.execute(
-                text(
-                    """
-                    INSERT INTO paddle_ocr_configs (provider, api_key, model_name)
-                    SELECT :provider, '', :model_name
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM paddle_ocr_configs WHERE provider = :provider
-                    )
-                    """
-                ),
-                {
-                    "provider": PADDLE_OCR_PROVIDER,
-                    "model_name": PADDLE_OCR_MODEL,
-                },
-            )
+        self._engine = get_database_engine()
+        initialize_paddle_ocr_configs_schema(self._engine)
 
     def get_config(self) -> PaddleOcrConfig:
         with self._engine.connect() as connection:
@@ -113,7 +78,7 @@ class PaddleOcrConfigService:
             ).mappings().fetchone()
 
         if row is None:
-            self._initialize_database()
+            initialize_paddle_ocr_configs_schema(self._engine)
             return self.get_config()
 
         return _row_to_config(row)

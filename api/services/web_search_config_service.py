@@ -3,27 +3,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
-from api.core.settings import get_database_url
-
-
-CREATE_WEB_SEARCH_CONFIGS_SQL = """
-CREATE TABLE IF NOT EXISTS web_search_configs (
-    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    provider VARCHAR(32) NOT NULL DEFAULT 'tavily',
-    api_key VARCHAR(512) NOT NULL DEFAULT '',
-    is_enabled TINYINT(1) NOT NULL DEFAULT 1,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    PRIMARY KEY (id),
-    UNIQUE KEY uq_web_search_configs_provider (provider),
-    KEY idx_web_search_configs_enabled_updated (is_enabled, updated_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-"""
-
-WEB_SEARCH_PROVIDER = "tavily"
-WEB_SEARCH_PROVIDER_LABEL = "Tavily"
+from api.db.core import get_database_engine
+from api.db.defaults import WEB_SEARCH_PROVIDER, WEB_SEARCH_PROVIDER_LABEL
+from api.db.schema import initialize_web_search_configs_schema
 
 
 @dataclass(frozen=True)
@@ -63,36 +47,8 @@ def _row_to_web_search_config(row: Mapping[str, object]) -> WebSearchConfig:
 
 class WebSearchConfigService:
     def __init__(self) -> None:
-        self._engine = create_engine(
-            get_database_url(),
-            pool_pre_ping=True,
-            pool_recycle=1800,
-            future=True,
-        )
-        self._initialize_database()
-
-    def _initialize_database(self) -> None:
-        with self._engine.begin() as connection:
-            connection.execute(text(CREATE_WEB_SEARCH_CONFIGS_SQL))
-            connection.execute(
-                text(
-                    """
-                    INSERT INTO web_search_configs (
-                        provider,
-                        api_key,
-                        is_enabled
-                    )
-                    SELECT
-                        :provider,
-                        '',
-                        TRUE
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM web_search_configs WHERE provider = :provider
-                    )
-                    """
-                ),
-                {"provider": WEB_SEARCH_PROVIDER},
-            )
+        self._engine = get_database_engine()
+        initialize_web_search_configs_schema(self._engine)
 
     def get_config(self) -> WebSearchConfig:
         with self._engine.connect() as connection:
@@ -115,7 +71,7 @@ class WebSearchConfigService:
             ).mappings().fetchone()
 
         if row is None:
-            self._initialize_database()
+            initialize_web_search_configs_schema(self._engine)
             return self.get_config()
 
         return _row_to_web_search_config(row)

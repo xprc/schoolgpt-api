@@ -5,79 +5,12 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from uuid import UUID, uuid4
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import Connection
-from sqlalchemy.engine.url import make_url
 
-from api.core.settings import get_database_url
+from api.db.core import get_database_engine
+from api.db.schema import initialize_conversations_schema
 from api.schemas.chat import ChatMessagePayload, ConversationShareScope
-from api.services.user_service import CREATE_USERS_SQL
-
-
-CREATE_CONVERSATIONS_SQL = """
-CREATE TABLE IF NOT EXISTS conversations (
-    id CHAR(36) NOT NULL,
-    owner_user_id BIGINT UNSIGNED NOT NULL,
-    title VARCHAR(255) NOT NULL,
-    share_scope VARCHAR(16) NOT NULL DEFAULT 'private',
-    is_pinned BOOLEAN NOT NULL DEFAULT FALSE,
-    pinned_at DATETIME(6) NULL,
-    is_visible BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-    PRIMARY KEY (id),
-    KEY idx_conversations_owner_updated (owner_user_id, updated_at),
-    KEY idx_conversations_owner_visible_pinned (
-        owner_user_id,
-        is_visible,
-        is_pinned,
-        pinned_at,
-        updated_at
-    ),
-    CONSTRAINT fk_conversations_owner
-        FOREIGN KEY (owner_user_id) REFERENCES users(id)
-        ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-"""
-
-CREATE_CONVERSATION_MESSAGES_SQL = """
-CREATE TABLE IF NOT EXISTS conversation_messages (
-    id CHAR(36) NOT NULL,
-    conversation_id CHAR(36) NOT NULL,
-    role VARCHAR(16) NOT NULL,
-    content MEDIUMTEXT NOT NULL,
-    rag_sources_json JSON NULL,
-    reasoning_content MEDIUMTEXT NULL,
-    reasoning_duration_ms INT UNSIGNED NULL,
-    position INT UNSIGNED NOT NULL,
-    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-    PRIMARY KEY (id),
-    UNIQUE KEY uq_conversation_messages_position (conversation_id, position),
-    KEY idx_conversation_messages_conversation (conversation_id),
-    CONSTRAINT fk_conversation_messages_conversation
-        FOREIGN KEY (conversation_id) REFERENCES conversations(id)
-        ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-"""
-
-CREATE_CONVERSATION_PERMISSIONS_SQL = """
-CREATE TABLE IF NOT EXISTS conversation_permissions (
-    conversation_id CHAR(36) NOT NULL,
-    user_id BIGINT UNSIGNED NOT NULL,
-    permission VARCHAR(16) NOT NULL DEFAULT 'read',
-    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-    PRIMARY KEY (conversation_id, user_id),
-    KEY idx_conversation_permissions_user (user_id),
-    CONSTRAINT fk_conversation_permissions_conversation
-        FOREIGN KEY (conversation_id) REFERENCES conversations(id)
-        ON DELETE CASCADE,
-    CONSTRAINT fk_conversation_permissions_user
-        FOREIGN KEY (user_id) REFERENCES users(id)
-        ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-"""
 
 VALID_SHARE_SCOPES = {"private", "link_read", "link_write"}
 VALID_PERMISSIONS = {"read", "write"}
@@ -157,10 +90,6 @@ class ConversationTotals:
 class ConversationAccess:
     permission: str
     can_write: bool
-
-
-def _quote_mysql_identifier(identifier: str) -> str:
-    return "`" + identifier.replace("`", "``") + "`"
 
 
 def _ensure_uuid(value: str | None) -> str:
@@ -409,45 +338,8 @@ def _normalize_reasoning_duration_ms(value: object) -> int | None:
 
 class ConversationService:
     def __init__(self) -> None:
-        database_url = get_database_url()
-        self._ensure_mysql_database(database_url)
-        self._engine = create_engine(
-            database_url,
-            pool_pre_ping=True,
-            pool_recycle=1800,
-            future=True,
-        )
-        self._initialize_database()
-
-    def _ensure_mysql_database(self, database_url: str) -> None:
-        url = make_url(database_url)
-        if not url.drivername.startswith("mysql") or not url.database:
-            return
-
-        server_engine = create_engine(
-            url.set(database=None),
-            pool_pre_ping=True,
-            future=True,
-        )
-
-        try:
-            with server_engine.begin() as connection:
-                connection.execute(
-                    text(
-                        "CREATE DATABASE IF NOT EXISTS "
-                        f"{_quote_mysql_identifier(url.database)} "
-                        "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
-                    )
-                )
-        finally:
-            server_engine.dispose()
-
-    def _initialize_database(self) -> None:
-        with self._engine.begin() as connection:
-            connection.execute(text(CREATE_USERS_SQL))
-            connection.execute(text(CREATE_CONVERSATIONS_SQL))
-            connection.execute(text(CREATE_CONVERSATION_MESSAGES_SQL))
-            connection.execute(text(CREATE_CONVERSATION_PERMISSIONS_SQL))
+        self._engine = get_database_engine()
+        initialize_conversations_schema(self._engine)
 
     def _fetch_conversation_row(
         self,

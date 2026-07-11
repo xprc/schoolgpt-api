@@ -16,10 +16,11 @@ import pandas as pd
 import pdfplumber
 from docx import Document as DocxDocument
 from PIL import Image, ImageOps
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Connection
+from sqlalchemy import text
 
-from api.core.settings import PROJECT_ROOT, get_database_url
+from api.core.settings import PROJECT_ROOT
+from api.db.core import get_database_engine
+from api.db.schema import initialize_rag_files_schema
 from api.services.paddle_ocr_service import (
     PaddleOcrClient,
     get_paddle_ocr_config_service,
@@ -27,31 +28,6 @@ from api.services.paddle_ocr_service import (
 from utils.config_handler import chroma_conf
 from utils.file_handler import get_file_sha256_hex
 
-
-CREATE_RAG_FILES_SQL = """
-CREATE TABLE IF NOT EXISTS rag_files (
-    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    original_name VARCHAR(255) NOT NULL,
-    original_extension VARCHAR(16) NOT NULL,
-    mime_type VARCHAR(255) NOT NULL DEFAULT '',
-    size_bytes BIGINT UNSIGNED NOT NULL,
-    sha256 CHAR(64) NOT NULL,
-    source_path VARCHAR(512) NOT NULL,
-    content_json_path VARCHAR(512) NOT NULL,
-    preview_pdf_path VARCHAR(512) NOT NULL,
-    content_json LONGTEXT NOT NULL,
-    status VARCHAR(16) NOT NULL DEFAULT 'pending',
-    error_message TEXT NULL,
-    chunk_count INT UNSIGNED NOT NULL DEFAULT 0,
-    used_ocr TINYINT(1) NOT NULL DEFAULT 0,
-    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-    PRIMARY KEY (id),
-    UNIQUE KEY uq_rag_files_sha256 (sha256),
-    KEY idx_rag_files_status_updated (status, updated_at),
-    KEY idx_rag_files_name (original_name)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-"""
 
 ALLOWED_RAG_UPLOAD_EXTENSIONS = (
     ".doc",
@@ -831,12 +807,7 @@ def _row_to_rag_file(row: Mapping[str, object]) -> RagFileRecord:
 
 class RagFileService:
     def __init__(self) -> None:
-        self._engine = create_engine(
-            get_database_url(),
-            pool_pre_ping=True,
-            pool_recycle=1800,
-            future=True,
-        )
+        self._engine = get_database_engine()
         self.data_path = self._resolve_data_path()
         self.original_dir = self.data_path / "uploaded"
         self.content_dir = self.data_path / "content"
@@ -862,34 +833,7 @@ class RagFileService:
         return (PROJECT_ROOT / path).resolve()
 
     def _initialize_database(self) -> None:
-        with self._engine.begin() as connection:
-            connection.execute(text(CREATE_RAG_FILES_SQL))
-            self._ensure_used_ocr_column(connection)
-
-    def _ensure_used_ocr_column(self, connection: Connection) -> None:
-        if self._engine.dialect.name != "mysql":
-            return
-
-        count = connection.execute(
-            text(
-                """
-                SELECT COUNT(*)
-                FROM INFORMATION_SCHEMA.COLUMNS
-                WHERE TABLE_SCHEMA = DATABASE()
-                    AND TABLE_NAME = 'rag_files'
-                    AND COLUMN_NAME = 'used_ocr'
-                """
-            )
-        ).scalar_one()
-        if int(count) == 0:
-            connection.execute(
-                text(
-                    """
-                    ALTER TABLE rag_files
-                    ADD COLUMN used_ocr TINYINT(1) NOT NULL DEFAULT 0 AFTER chunk_count
-                    """
-                )
-            )
+        initialize_rag_files_schema(self._engine)
 
     def create_temp_upload_path(self, filename: str) -> Path:
         safe_name = _safe_original_name(filename)
