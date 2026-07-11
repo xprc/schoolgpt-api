@@ -104,7 +104,7 @@ source .venv/bin/activate
 export SCHOOLGPT_AUTH_SECRET_KEY='请替换为随机密钥'
 export SCHOOLGPT_CORS_ORIGINS='["https://你的域名"]'
 
-uvicorn api.main:app --host 127.0.0.1 --port 8000
+uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
 如果没有域名、只是用服务器 IP 测试，可将 `SCHOOLGPT_CORS_ORIGINS` 临时改为：
@@ -132,7 +132,7 @@ After=network.target mysql.service
 WorkingDirectory=/opt/schoolgpt/schoolgpt-api
 Environment="SCHOOLGPT_AUTH_SECRET_KEY=请替换为随机密钥"
 Environment="SCHOOLGPT_CORS_ORIGINS=[\"https://你的域名\"]"
-ExecStart=/opt/schoolgpt/schoolgpt-api/.venv/bin/uvicorn api.main:app --host 127.0.0.1 --port 8000
+ExecStart=/opt/schoolgpt/schoolgpt-api/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000
 Restart=always
 RestartSec=3
 
