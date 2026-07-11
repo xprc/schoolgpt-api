@@ -105,8 +105,23 @@ class WebSearchConfigUpdateRequest(BaseModel):
     is_enabled: bool = True
 
 
+class PaddleOcrConfigResponse(BaseModel):
+    id: int
+    provider: Literal["baidu_aistudio"]
+    provider_label: str
+    model_name: str
+    has_api_key: bool
+    api_key_mask: str
+    created_at: str
+    updated_at: str
+
+
+class PaddleOcrConfigUpdateRequest(BaseModel):
+    api_key: str | None = Field(None, max_length=1024)
+
+
 class RagKnowledgeFileResponse(RagFileSummaryResponse):
-    pass
+    used_ocr: bool = False
 
 
 class RagStatusResponse(BaseModel):

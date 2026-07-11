@@ -21,6 +21,8 @@ from api.schemas.admin import (
     ModelConfigResponse,
     ModelConfigUpdateRequest,
     ModelProviderOptionResponse,
+    PaddleOcrConfigResponse,
+    PaddleOcrConfigUpdateRequest,
     RagStatusResponse,
     WebSearchConfigResponse,
     WebSearchConfigUpdateRequest,
@@ -35,6 +37,11 @@ from api.services.model_config_service import (
     ModelConfigService,
     ModelProviderOption,
     get_model_config_service,
+)
+from api.services.paddle_ocr_service import (
+    PaddleOcrConfig,
+    PaddleOcrConfigService,
+    get_paddle_ocr_config_service,
 )
 from api.services.user_service import (
     AdminUser,
@@ -144,6 +151,22 @@ def _to_web_search_config_response(
         is_enabled=web_search_config.is_enabled,
         created_at=web_search_config.created_at,
         updated_at=web_search_config.updated_at,
+    )
+
+
+def _to_paddle_ocr_config_response(
+    paddle_ocr_config: PaddleOcrConfig,
+) -> PaddleOcrConfigResponse:
+    api_key = paddle_ocr_config.api_key.strip()
+    return PaddleOcrConfigResponse(
+        id=paddle_ocr_config.id,
+        provider=paddle_ocr_config.provider,
+        provider_label=paddle_ocr_config.provider_label,
+        model_name=paddle_ocr_config.model_name,
+        has_api_key=bool(api_key),
+        api_key_mask=_api_key_mask(api_key),
+        created_at=paddle_ocr_config.created_at,
+        updated_at=paddle_ocr_config.updated_at,
     )
 
 
@@ -451,6 +474,35 @@ async def get_rag_status(
     _: User = Depends(require_admin_user),
 ) -> RagStatusResponse:
     return _get_rag_status_response()
+
+
+@router.get("/paddle-ocr-config", response_model=PaddleOcrConfigResponse)
+async def get_paddle_ocr_config(
+    _: User = Depends(require_admin_user),
+    paddle_ocr_config_service: PaddleOcrConfigService = Depends(
+        get_paddle_ocr_config_service
+    ),
+) -> PaddleOcrConfigResponse:
+    return _to_paddle_ocr_config_response(paddle_ocr_config_service.get_config())
+
+
+@router.put("/paddle-ocr-config", response_model=PaddleOcrConfigResponse)
+async def update_paddle_ocr_config(
+    request: PaddleOcrConfigUpdateRequest,
+    _: User = Depends(require_admin_user),
+    paddle_ocr_config_service: PaddleOcrConfigService = Depends(
+        get_paddle_ocr_config_service
+    ),
+) -> PaddleOcrConfigResponse:
+    try:
+        paddle_ocr_config = paddle_ocr_config_service.update_config(request.api_key)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    return _to_paddle_ocr_config_response(paddle_ocr_config)
 
 
 @router.post("/rag/files", response_model=RagStatusResponse)

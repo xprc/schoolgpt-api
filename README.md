@@ -37,7 +37,9 @@ sudo apt install -y python3 python3-venv python3-pip mysql-server nginx
 
 ### 2. 安装 LibreOffice 与中文字体
 
-RAG 上传的 `doc`、`docx`、`txt`、`csv`、`xls`、`xlsx` 等非 PDF 文件会通过 LibreOffice headless 转成前端预览 PDF；上传的 `pdf` 会直接作为预览 PDF 使用。服务器必须安装 LibreOffice，否则非 PDF 文件会处理失败。
+RAG 上传的 `doc`、`docx`、`txt`、`csv`、`xls`、`xlsx` 等办公文件会通过 LibreOffice headless 转成前端预览 PDF；上传的 `pdf` 会直接作为预览 PDF 使用。服务器必须安装 LibreOffice，否则办公文件会处理失败。
+
+`png`、`jpg`、`jpeg` 和自动识别出的图片型 PDF 使用百度 AI Studio 的 PaddleOCR 异步 API。管理员需先在 Admin 管理中心的“百度 OCR”页面填写 AI Studio Access Token（页面中按 API Key 管理）。OCR 文字仅写入原有 RAG JSON 和向量库；前端预览仍为原 PDF 或不含隐藏文字层的纯图片 PDF。
 
 Ubuntu 推荐安装 LibreOffice、Noto CJK 字体和字体缓存工具：
 

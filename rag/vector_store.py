@@ -300,6 +300,7 @@ class VectorStoreService:
             "error_message": file_record.error_message,
             "indexed": file_record.status == "ready" and chunk_count > 0,
             "chunk_count": chunk_count,
+            "used_ocr": file_record.used_ocr,
         }
 
     def _build_documents(self, file_record: RagFileRecord) -> tuple[list[Document], list[str]]:

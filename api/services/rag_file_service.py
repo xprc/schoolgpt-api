@@ -15,9 +15,15 @@ from typing import Any
 import pandas as pd
 import pdfplumber
 from docx import Document as DocxDocument
+from PIL import Image, ImageOps
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Connection
 
 from api.core.settings import PROJECT_ROOT, get_database_url
+from api.services.paddle_ocr_service import (
+    PaddleOcrClient,
+    get_paddle_ocr_config_service,
+)
 from utils.config_handler import chroma_conf
 from utils.file_handler import get_file_sha256_hex
 
@@ -37,6 +43,7 @@ CREATE TABLE IF NOT EXISTS rag_files (
     status VARCHAR(16) NOT NULL DEFAULT 'pending',
     error_message TEXT NULL,
     chunk_count INT UNSIGNED NOT NULL DEFAULT 0,
+    used_ocr TINYINT(1) NOT NULL DEFAULT 0,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
     PRIMARY KEY (id),
@@ -54,10 +61,14 @@ ALLOWED_RAG_UPLOAD_EXTENSIONS = (
     ".csv",
     ".xls",
     ".xlsx",
+    ".png",
+    ".jpg",
+    ".jpeg",
 )
 
 RAG_FILE_STATUS_PENDING = "pending"
 RAG_FILE_STATUS_EXTRACTING = "extracting"
+RAG_FILE_STATUS_OCR = "ocr"
 RAG_FILE_STATUS_RENDERING = "rendering"
 RAG_FILE_STATUS_INDEXING = "indexing"
 RAG_FILE_STATUS_READY = "ready"
@@ -86,6 +97,7 @@ class RagFileRecord:
     status: str
     error_message: str | None
     chunk_count: int
+    used_ocr: bool
     created_at: str
     updated_at: str
 
@@ -583,6 +595,79 @@ def _pdf_to_structured_content(
     return _new_structured_content(original_name, extension, sha256, pages)
 
 
+def _is_image_pdf(path: Path) -> bool:
+    """Return true for scanned/image PDFs that have no meaningful text layer."""
+    with pdfplumber.open(str(path)) as pdf:
+        if not pdf.pages:
+            return False
+
+        text_character_count = 0
+        image_page_count = 0
+        for page in pdf.pages:
+            text_character_count += len(re.sub(r"\s+", "", page.extract_text() or ""))
+            if page.images:
+                image_page_count += 1
+
+        average_text_characters = text_character_count / len(pdf.pages)
+        return image_page_count == len(pdf.pages) and average_text_characters < 40
+
+
+def requires_paddle_ocr(path: Path, original_name: str) -> bool:
+    extension = _extension(original_name)
+    if extension in {".png", ".jpg", ".jpeg"}:
+        return True
+    if extension == ".pdf":
+        return _is_image_pdf(path)
+    return False
+
+
+def _ocr_pages_to_structured_content(
+    page_texts: list[str],
+    original_name: str,
+    extension: str,
+    sha256: str,
+) -> dict[str, Any]:
+    pages = []
+    for page_number, text_value in enumerate(page_texts, 1):
+        block = _make_block(
+            page_number,
+            1,
+            "ocr_markdown",
+            text_value,
+            bbox=None,
+        )
+        pages.append(
+            {
+                "page_number": page_number,
+                "blocks": [block] if block else [],
+            }
+        )
+
+    content = _new_structured_content(original_name, extension, sha256, pages)
+    if not structured_content_text_blocks(
+        json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+    ):
+        raise ValueError("PaddleOCR 未识别到可用于 RAG 的文字")
+
+    return content
+
+
+def extract_paddle_ocr_content(
+    path: Path,
+    original_name: str,
+    sha256: str,
+) -> tuple[str, dict[str, Any]]:
+    config = get_paddle_ocr_config_service().get_config()
+    client = PaddleOcrClient(config.api_key, model_name=config.model_name)
+    job_id, page_texts = client.extract_pages(path)
+    return job_id, _ocr_pages_to_structured_content(
+        page_texts,
+        original_name,
+        _extension(original_name),
+        sha256,
+    )
+
+
 def extract_structured_content(path: Path, original_name: str, sha256: str) -> dict[str, Any]:
     extension = _extension(original_name)
 
@@ -629,6 +714,30 @@ def _copy_pdf_preview(source_path: Path, output_path: Path, content: dict[str, A
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if source_path.resolve() != output_path.resolve():
         shutil.copyfile(source_path, output_path)
+
+    return _update_preview_metadata(content, output_path)
+
+
+def _image_to_pdf_preview(
+    source_path: Path,
+    output_path: Path,
+    content: dict[str, Any],
+) -> dict[str, Any]:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(source_path) as source_image:
+        oriented_image = ImageOps.exif_transpose(source_image)
+        if oriented_image.mode in {"RGBA", "LA"} or "transparency" in oriented_image.info:
+            rgba_image = oriented_image.convert("RGBA")
+            rgb_image = Image.new("RGB", rgba_image.size, "white")
+            rgb_image.paste(rgba_image, mask=rgba_image.getchannel("A"))
+        else:
+            rgb_image = oriented_image.convert("RGB")
+
+        try:
+            resolution = float(source_image.info.get("dpi", (96, 96))[0] or 96)
+        except (TypeError, ValueError, IndexError):
+            resolution = 96
+        rgb_image.save(output_path, "PDF", resolution=max(36, resolution))
 
     return _update_preview_metadata(content, output_path)
 
@@ -685,8 +794,11 @@ def generate_preview_pdf(
     output_path: Path,
     content: dict[str, Any],
 ) -> dict[str, Any]:
-    if _extension(source_path.name) == ".pdf":
+    extension = _extension(source_path.name)
+    if extension == ".pdf":
         return _copy_pdf_preview(source_path, output_path, content)
+    if extension in {".png", ".jpg", ".jpeg"}:
+        return _image_to_pdf_preview(source_path, output_path, content)
 
     _convert_with_libreoffice_to_pdf(source_path, output_path)
     return _update_preview_metadata(content, output_path)
@@ -711,6 +823,7 @@ def _row_to_rag_file(row: Mapping[str, object]) -> RagFileRecord:
             else None
         ),
         chunk_count=int(row["chunk_count"] or 0),
+        used_ocr=bool(row["used_ocr"]),
         created_at=_isoformat(row["created_at"]),
         updated_at=_isoformat(row["updated_at"]),
     )
@@ -751,6 +864,32 @@ class RagFileService:
     def _initialize_database(self) -> None:
         with self._engine.begin() as connection:
             connection.execute(text(CREATE_RAG_FILES_SQL))
+            self._ensure_used_ocr_column(connection)
+
+    def _ensure_used_ocr_column(self, connection: Connection) -> None:
+        if self._engine.dialect.name != "mysql":
+            return
+
+        count = connection.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                    AND TABLE_NAME = 'rag_files'
+                    AND COLUMN_NAME = 'used_ocr'
+                """
+            )
+        ).scalar_one()
+        if int(count) == 0:
+            connection.execute(
+                text(
+                    """
+                    ALTER TABLE rag_files
+                    ADD COLUMN used_ocr TINYINT(1) NOT NULL DEFAULT 0 AFTER chunk_count
+                    """
+                )
+            )
 
     def create_temp_upload_path(self, filename: str) -> Path:
         safe_name = _safe_original_name(filename)
@@ -775,6 +914,7 @@ class RagFileService:
         existing = self.get_file_by_sha256(sha256, include_content=False)
         if existing is not None and existing.status in {
             RAG_FILE_STATUS_EXTRACTING,
+            RAG_FILE_STATUS_OCR,
             RAG_FILE_STATUS_RENDERING,
             RAG_FILE_STATUS_INDEXING,
             RAG_FILE_STATUS_READY,
@@ -868,6 +1008,7 @@ class RagFileService:
                             status = :status,
                             error_message = :error_message,
                             chunk_count = 0,
+                            used_ocr = 0,
                             updated_at = :now
                         WHERE id = :file_id
                         """
@@ -891,6 +1032,7 @@ class RagFileService:
             RAG_FILE_STATUS_EXTRACTING,
             error_message=None,
             chunk_count=0,
+            used_ocr=False,
         )
 
         source_path = _resolve_project_path(record.source_path)
@@ -898,11 +1040,25 @@ class RagFileService:
         preview_pdf_path = _resolve_project_path(record.preview_pdf_path)
 
         try:
-            structured_content = extract_structured_content(
-                source_path,
-                record.original_name,
-                record.sha256,
-            )
+            use_ocr = requires_paddle_ocr(source_path, record.original_name)
+            if use_ocr:
+                self.update_file_status(
+                    file_id,
+                    RAG_FILE_STATUS_OCR,
+                    error_message=None,
+                    used_ocr=True,
+                )
+                _, structured_content = extract_paddle_ocr_content(
+                    source_path,
+                    record.original_name,
+                    record.sha256,
+                )
+            else:
+                structured_content = extract_structured_content(
+                    source_path,
+                    record.original_name,
+                    record.sha256,
+                )
             self.update_file_status(file_id, RAG_FILE_STATUS_RENDERING)
             structured_content = generate_preview_pdf(
                 source_path,
@@ -971,6 +1127,7 @@ class RagFileService:
                         status,
                         error_message,
                         chunk_count,
+                        used_ocr,
                         created_at,
                         updated_at
                     FROM rag_files
@@ -1000,6 +1157,7 @@ class RagFileService:
                         status,
                         error_message,
                         chunk_count,
+                        used_ocr,
                         created_at,
                         updated_at
                     FROM rag_files
@@ -1035,6 +1193,7 @@ class RagFileService:
                         status,
                         error_message,
                         chunk_count,
+                        used_ocr,
                         created_at,
                         updated_at
                     FROM rag_files
@@ -1071,6 +1230,7 @@ class RagFileService:
                         status,
                         error_message,
                         chunk_count,
+                        used_ocr,
                         created_at,
                         updated_at
                     FROM rag_files
@@ -1116,6 +1276,7 @@ class RagFileService:
         status_value: str,
         error_message: str | None = None,
         chunk_count: int | None = None,
+        used_ocr: bool | None = None,
     ) -> None:
         assignments = [
             "status = :status",
@@ -1132,6 +1293,10 @@ class RagFileService:
         if chunk_count is not None:
             assignments.append("chunk_count = :chunk_count")
             payload["chunk_count"] = max(0, int(chunk_count))
+
+        if used_ocr is not None:
+            assignments.append("used_ocr = :used_ocr")
+            payload["used_ocr"] = bool(used_ocr)
 
         with self._engine.begin() as connection:
             connection.execute(
