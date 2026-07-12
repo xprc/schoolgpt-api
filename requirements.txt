@@ -11,7 +11,7 @@ PyMySQL==1.1.1
 bcrypt==5.0.0
 
 # Configuration and HTTP helpers
-PyYAML==6.0.2
+PyYAML==6.0.3
 python-dotenv==1.2.2
 requests==2.32.5
 
