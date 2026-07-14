@@ -19,5 +19,6 @@ WEB_SEARCH_PROVIDER_LABEL = "Tavily"
 
 PADDLE_OCR_PROVIDER = "baidu_aistudio"
 PADDLE_OCR_PROVIDER_LABEL = "百度 AI Studio PaddleOCR"
-PADDLE_OCR_MODEL = "PaddleOCR-VL-1.5"
+PADDLE_OCR_JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
+PADDLE_OCR_MODEL = "PaddleOCR-VL-1.6"
 
