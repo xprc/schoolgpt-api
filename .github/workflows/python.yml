@@ -60,7 +60,7 @@ jobs:
         run: |
           set -euo pipefail
           rm -f config/runtime_setup.json
-          uvicorn api.main:app \
+          uvicorn app:app \
             --host 127.0.0.1 \
             --port 8000 \
             >uvicorn.log 2>&1 &
