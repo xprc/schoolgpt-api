@@ -7,8 +7,8 @@ from hashlib import sha256
 import bcrypt
 from sqlalchemy import text
 
-from api.db.core import get_database_engine
-from api.db.schema import initialize_users_schema
+from db.core import get_database_engine
+from db.schema import initialize_users_schema
 
 VALID_USER_TYPES = {"student", "teacher", "maintenance", "admin"}
 VALID_PREFERRED_LANGUAGES = {"en", "zh"}

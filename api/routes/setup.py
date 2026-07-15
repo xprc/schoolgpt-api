@@ -4,7 +4,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from api.core.settings import is_setup_complete
 from api.schemas.setup import FirstRunSetupRequest, SetupStatusResponse
 from api.services.conversation_service import get_conversation_service
-from api.services.model_config_service import get_model_config_service
+from model.config_service import get_model_config_service
 from api.services.setup_service import (
     SetupAlreadyCompleteError,
     initialize_first_run,

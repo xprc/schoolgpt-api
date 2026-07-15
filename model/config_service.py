@@ -5,9 +5,9 @@ from functools import lru_cache
 
 from sqlalchemy import text
 
-from api.db.core import get_database_engine
-from api.db.defaults import MODEL_PROVIDER_DEFAULTS
-from api.db.schema import initialize_model_configs_schema
+from db.core import get_database_engine
+from db.defaults import MODEL_PROVIDER_DEFAULTS
+from db.schema import initialize_model_configs_schema
 
 
 @dataclass(frozen=True)

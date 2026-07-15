@@ -11,7 +11,7 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from api.services.rag_file_service import (
+from rag.file_service import (
     RagFileRecord,
     get_rag_file_service,
     structured_content_text_blocks,

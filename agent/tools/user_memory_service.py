@@ -7,8 +7,8 @@ from uuid import UUID, uuid4
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
-from api.db.core import get_database_engine
-from api.db.schema import initialize_user_memories_schema
+from db.core import get_database_engine
+from db.schema import initialize_user_memories_schema
 
 
 MAX_MEMORY_CONTENT_LENGTH = 4000

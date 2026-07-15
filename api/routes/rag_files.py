@@ -3,7 +3,7 @@ from fastapi.responses import FileResponse
 
 from api.core.security import TokenPayload, get_current_token_payload
 from api.schemas.rag_files import RagFileDetailResponse, RagFileSummaryResponse
-from api.services.rag_file_service import (
+from rag.file_service import (
     RagFileRecord,
     RagFileService,
     get_rag_file_service,

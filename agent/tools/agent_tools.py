@@ -5,8 +5,8 @@ from urllib.parse import urlparse
 from langchain_core.tools import tool
 
 from agent.tools.user_context import get_current_agent_user_id
-from api.services.web_search_config_service import get_web_search_config_service
-from api.services.user_memory_service import get_user_memory_service
+from agent.tools.web_search_config_service import get_web_search_config_service
+from agent.tools.user_memory_service import get_user_memory_service
 from api.services.user_service import get_user_service
 from rag.rag_service import PolicyRagSearchService
 

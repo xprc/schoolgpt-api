@@ -5,9 +5,9 @@ from api.core.settings import (
     is_setup_complete,
     save_setup_config,
 )
-from api.db.core import create_database_engine
-from api.db.schema import create_first_run_schema
-from api.db.seeds import (
+from db.core import create_database_engine
+from db.schema import create_first_run_schema
+from db.seeds import (
     seed_default_model_config,
     seed_default_paddle_ocr_config,
     seed_default_web_search_config,

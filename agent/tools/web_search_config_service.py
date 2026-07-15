@@ -5,9 +5,9 @@ from functools import lru_cache
 
 from sqlalchemy import text
 
-from api.db.core import get_database_engine
-from api.db.defaults import WEB_SEARCH_PROVIDER, WEB_SEARCH_PROVIDER_LABEL
-from api.db.schema import initialize_web_search_configs_schema
+from db.core import get_database_engine
+from db.defaults import WEB_SEARCH_PROVIDER, WEB_SEARCH_PROVIDER_LABEL
+from db.schema import initialize_web_search_configs_schema
 
 
 @dataclass(frozen=True)

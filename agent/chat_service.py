@@ -3,11 +3,11 @@ import json
 from collections.abc import AsyncIterator, Mapping, Sequence
 from functools import lru_cache
 
-from api.services.model_config_service import ModelConfigService, get_model_config_service
-from api.services.model_config_service import ModelConfig
+from model.config_service import ModelConfigService, get_model_config_service
+from model.config_service import ModelConfig
 from model.factory import ModelConfigurationError, create_webchat_model
 from rag.source_context import get_rag_sources, reset_rag_sources, restore_rag_sources
-from utils.prompt_loader import load_system_prompt
+from prompts.prompt_loader import load_system_prompt
 
 
 class ChatService:
@@ -126,6 +126,7 @@ class ChatService:
         self,
         model_config: ModelConfig,
         messages: Sequence[Mapping[str, str]] | str,
+        user_runtime_context: str | None = None,
     ):
         from openai import OpenAI
 
@@ -134,7 +135,7 @@ class ChatService:
         openai_messages = [
             {
                 "role": "system",
-                "content": load_system_prompt(),
+                "content": self._build_system_prompt(user_runtime_context),
             }
         ]
         if rag_context:
@@ -185,12 +186,17 @@ class ChatService:
                     "content": content,
                 }
 
+    @staticmethod
+    def _build_system_prompt(user_runtime_context: str | None = None) -> str:
+        return load_system_prompt(user_runtime_context)
+
     async def stream_response(
         self,
         query: str,
         delay_seconds: float,
         enable_thinking: bool = True,
         user_id: int | None = None,
+        user_runtime_context: str | None = None,
     ) -> AsyncIterator[str]:
         rag_token = reset_rag_sources()
         try:
@@ -199,6 +205,7 @@ class ChatService:
                 delay_seconds,
                 enable_thinking,
                 user_id,
+                user_runtime_context,
             ):
                 payload: object = event["content"]
                 if event["type"] != "content":
@@ -230,12 +237,14 @@ class ChatService:
         delay_seconds: float,
         enable_thinking: bool = True,
         user_id: int | None = None,
+        user_runtime_context: str | None = None,
     ) -> AsyncIterator[str]:
         async for event in self.stream_events(
             messages,
             delay_seconds,
             enable_thinking,
             user_id,
+            user_runtime_context,
         ):
             if event["type"] == "content":
                 yield event["content"]
@@ -246,9 +255,14 @@ class ChatService:
         delay_seconds: float,
         enable_thinking: bool = True,
         user_id: int | None = None,
+        user_runtime_context: str | None = None,
     ) -> AsyncIterator[dict[str, str]]:
         agent = self._get_agent(enable_thinking)
-        chunks = agent.execute_stream(messages, user_id=user_id)
+        chunks = agent.execute_stream(
+            messages,
+            user_id=user_id,
+            user_runtime_context=user_runtime_context,
+        )
         pending_reasoning_parts: list[str] = []
         saw_content = False
 

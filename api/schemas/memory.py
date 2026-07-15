@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 
-from api.services.user_memory_service import MAX_MEMORY_CONTENT_LENGTH
+from agent.tools.user_memory_service import MAX_MEMORY_CONTENT_LENGTH
 
 
 class UserMemoryCreateRequest(BaseModel):

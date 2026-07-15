@@ -6,7 +6,7 @@ from api.schemas.memory import (
     UserMemoryResponse,
     UserMemoryUpdateRequest,
 )
-from api.services.user_memory_service import (
+from agent.tools.user_memory_service import (
     UserMemory,
     UserMemoryService,
     get_user_memory_service,

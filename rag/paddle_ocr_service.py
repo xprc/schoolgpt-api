@@ -11,13 +11,13 @@ from typing import Any
 import requests
 from sqlalchemy import text
 
-from api.db.core import get_database_engine
-from api.db.defaults import (
+from db.core import get_database_engine
+from db.defaults import (
     PADDLE_OCR_MODEL,
     PADDLE_OCR_PROVIDER,
     PADDLE_OCR_PROVIDER_LABEL,
 )
-from api.db.schema import initialize_paddle_ocr_configs_schema
+from db.schema import initialize_paddle_ocr_configs_schema
 
 PADDLE_OCR_JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
 PADDLE_OCR_LOCAL_FILE_LIMIT = 50 * 1024 * 1024

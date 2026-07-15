@@ -6,7 +6,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.runtime import Runtime
 from langgraph.types import Command
 from utils.logger_handler import logger
-from utils.prompt_loader import load_system_prompt, load_report_prompt
+from prompts.prompt_loader import load_system_prompt, load_report_prompt
 
 
 @wrap_tool_call
@@ -38,7 +38,8 @@ def log_before_model(state: AgentState, _runtime: Runtime) -> dict[str, Any] | N
 @dynamic_prompt
 def report_prompt_switch(request: ModelRequest) -> str:
     is_report = request.runtime.context.get("report", False)
+    user_runtime_context = request.runtime.context.get("user_runtime_context")
     if is_report:
-        return load_report_prompt()
+        return load_report_prompt(user_runtime_context)
 
-    return load_system_prompt()
+    return load_system_prompt(user_runtime_context)

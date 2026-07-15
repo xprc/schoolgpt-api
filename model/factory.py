@@ -4,7 +4,7 @@ from pathlib import Path
 from langchain_community.chat_models.tongyi import ChatTongyi
 from langchain_community.embeddings import HuggingFaceBgeEmbeddings
 
-from api.services.model_config_service import ModelConfig, get_model_config_service
+from model.config_service import ModelConfig, get_model_config_service
 from utils.config_handler import rag_conf
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI

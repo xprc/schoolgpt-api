@@ -1,7 +1,7 @@
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
-from api.db.defaults import (
+from db.defaults import (
     DEFAULT_MODEL_PROVIDER,
     MODEL_PROVIDER_DEFAULTS,
     PADDLE_OCR_MODEL,

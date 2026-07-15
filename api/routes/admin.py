@@ -32,13 +32,13 @@ from api.services.conversation_service import (
     ConversationService,
     get_conversation_service,
 )
-from api.services.model_config_service import (
+from model.config_service import (
     ModelConfig,
     ModelConfigService,
     ModelProviderOption,
     get_model_config_service,
 )
-from api.services.paddle_ocr_service import (
+from rag.paddle_ocr_service import (
     PaddleOcrConfig,
     PaddleOcrConfigService,
     get_paddle_ocr_config_service,
@@ -49,12 +49,12 @@ from api.services.user_service import (
     UserService,
     get_user_service,
 )
-from api.services.web_search_config_service import (
+from agent.tools.web_search_config_service import (
     WebSearchConfig,
     WebSearchConfigService,
     get_web_search_config_service,
 )
-from api.services.rag_file_service import get_rag_file_service
+from rag.file_service import get_rag_file_service
 from rag.vector_store import get_vector_store_service
 
 router = APIRouter(prefix="/admin", tags=["admin"])

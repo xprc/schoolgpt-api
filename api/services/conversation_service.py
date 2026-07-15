@@ -8,8 +8,8 @@ from uuid import UUID, uuid4
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
-from api.db.core import get_database_engine
-from api.db.schema import initialize_conversations_schema
+from db.core import get_database_engine
+from db.schema import initialize_conversations_schema
 from api.schemas.chat import ChatMessagePayload, ConversationShareScope
 
 VALID_SHARE_SCOPES = {"private", "link_read", "link_write"}

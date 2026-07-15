@@ -58,4 +58,3 @@ def create_database_engine(
 @lru_cache(maxsize=1)
 def get_database_engine() -> Engine:
     return create_database_engine()
-

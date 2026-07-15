@@ -19,9 +19,9 @@ from PIL import Image, ImageOps
 from sqlalchemy import text
 
 from api.core.settings import PROJECT_ROOT
-from api.db.core import get_database_engine
-from api.db.schema import initialize_rag_files_schema
-from api.services.paddle_ocr_service import (
+from db.core import get_database_engine
+from db.schema import initialize_rag_files_schema
+from rag.paddle_ocr_service import (
     PaddleOcrClient,
     get_paddle_ocr_config_service,
 )

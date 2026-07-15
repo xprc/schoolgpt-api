@@ -2,7 +2,7 @@ import json
 from collections.abc import AsyncIterator
 from time import perf_counter
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
 from api.core.security import TokenPayload, get_current_token_payload
@@ -13,9 +13,11 @@ from api.services.conversation_service import (
     ConversationService,
     get_conversation_service,
 )
-from api.services.chat_service import ChatService, get_chat_service
+from api.services.user_service import UserService, get_user_service
+from agent.chat_service import ChatService, get_chat_service
 from model.factory import ModelConfigurationError
 from rag.source_context import get_rag_sources, reset_rag_sources, restore_rag_sources
+from prompts.prompt_loader import build_user_runtime_context, resolve_client_ip
 
 router = APIRouter(
     prefix="/chat",
@@ -72,14 +74,16 @@ def _build_context_messages(
 
 @router.post("")
 async def stream_chat(
-    request: ChatRequest,
+    chat_request: ChatRequest,
+    http_request: Request,
     token_payload: TokenPayload = Depends(get_current_token_payload),
     service: ChatService = Depends(get_chat_service),
     conversation_service: ConversationService = Depends(get_conversation_service),
+    user_service: UserService = Depends(get_user_service),
     settings: Settings = Depends(get_settings),
 ) -> StreamingResponse:
     try:
-        service.ensure_ready(request.enable_thinking)
+        service.ensure_ready(chat_request.enable_thinking)
     except ModelConfigurationError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -87,10 +91,10 @@ async def stream_chat(
         ) from exc
 
     conversation_messages: list[object] = []
-    if request.conversation_id:
+    if chat_request.conversation_id:
         try:
             conversation = conversation_service.get_conversation(
-                request.conversation_id,
+                chat_request.conversation_id,
                 token_payload.user_id,
             )
             if not conversation.can_write:
@@ -100,7 +104,7 @@ async def stream_chat(
                 )
             conversation_messages = list(conversation.messages)
         except ConversationNotFoundError as exc:
-            if conversation_service.conversation_exists(request.conversation_id):
+            if conversation_service.conversation_exists(chat_request.conversation_id):
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail="对话不存在或无权访问",
@@ -111,7 +115,15 @@ async def stream_chat(
                 detail="对话不存在或无权访问",
             ) from exc
 
-    context_messages = _build_context_messages(request, conversation_messages)
+    context_messages = _build_context_messages(chat_request, conversation_messages)
+    client_ip = resolve_client_ip(
+        http_request.headers,
+        http_request.client.host if http_request.client else None,
+    )
+    user_runtime_context = build_user_runtime_context(
+        user_service.get_user_by_id(token_payload.user_id),
+        client_ip,
+    )
 
     async def stream_events() -> AsyncIterator[str]:
         rag_token = reset_rag_sources()
@@ -123,8 +135,9 @@ async def stream_chat(
             async for event in service.stream_events(
                 context_messages,
                 settings.stream_delay_seconds,
-                request.enable_thinking,
+                chat_request.enable_thinking,
                 token_payload.user_id,
+                user_runtime_context,
             ):
                 event_type = event["type"]
                 content = event["content"]
@@ -189,17 +202,17 @@ async def stream_chat(
                     + "\n\n"
                 )
 
-            if request.conversation_id:
+            if chat_request.conversation_id:
                 conversation_service.append_generated_exchange(
-                    conversation_id=request.conversation_id,
+                    conversation_id=chat_request.conversation_id,
                     user_id=token_payload.user_id,
-                    query=request.query,
+                    query=chat_request.query,
                     ai_content=ai_content,
                     rag_sources=rag_sources,
                     reasoning_content=reasoning_content or None,
                     reasoning_duration_ms=reasoning_duration_ms,
-                    message_id=request.message_id,
-                    response_id=request.response_id,
+                    message_id=chat_request.message_id,
+                    response_id=chat_request.response_id,
                 )
 
             yield "data: [DONE]\n\n"

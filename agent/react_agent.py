@@ -8,7 +8,7 @@ from agent.tools.user_context import (
     set_current_agent_user_id,
 )
 from model.factory import create_webchat_model
-from utils.prompt_loader import load_system_prompt
+from prompts.prompt_loader import load_system_prompt
 
 
 class ReactAgent(object):
@@ -327,14 +327,26 @@ class ReactAgent(object):
         return stream_item
 
     @staticmethod
-    def _agent_context(user_id: int | None) -> dict[str, object]:
+    def _agent_context(
+        user_id: int | None,
+        user_runtime_context: str | None = None,
+    ) -> dict[str, object]:
         context: dict[str, object] = {"report": False}
         if user_id is not None:
             context["user_id"] = user_id
 
+        normalized_context = str(user_runtime_context or "").strip()
+        if normalized_context:
+            context["user_runtime_context"] = normalized_context
+
         return context
 
-    def _execute_messages_stream(self, input_dict, user_id: int | None = None):
+    def _execute_messages_stream(
+        self,
+        input_dict,
+        user_id: int | None = None,
+        user_runtime_context: str | None = None,
+    ):
         pending_message_id = None
         pending_content = ""
         pending_has_tool_call = False
@@ -345,7 +357,7 @@ class ReactAgent(object):
         for stream_item in self.agent.stream(
             input_dict,
             stream_mode="messages",
-            context=self._agent_context(user_id),
+            context=self._agent_context(user_id, user_runtime_context),
         ):
             latest_message = self._stream_item_message(stream_item)
             if self._is_tool_message(latest_message):
@@ -422,7 +434,12 @@ class ReactAgent(object):
             pending_has_tool_call = False
             pending_tool_calls = {}
 
-    def _execute_values_stream(self, input_dict, user_id: int | None = None):
+    def _execute_values_stream(
+        self,
+        input_dict,
+        user_id: int | None = None,
+        user_runtime_context: str | None = None,
+    ):
         streamed_content = ""
         streamed_reasoning_content = ""
         reported_tool_call_texts = set()
@@ -430,7 +447,7 @@ class ReactAgent(object):
         for chunk in self.agent.stream(
             input_dict,
             stream_mode="values",
-            context=self._agent_context(user_id),
+            context=self._agent_context(user_id, user_runtime_context),
         ):
             messages = chunk.get("messages", [])
             if not messages:
@@ -499,7 +516,12 @@ class ReactAgent(object):
                 "content": delta,
             }
 
-    def execute_stream(self, messages, user_id: int | None = None):
+    def execute_stream(
+        self,
+        messages,
+        user_id: int | None = None,
+        user_runtime_context: str | None = None,
+    ):
         if isinstance(messages, str):
             input_messages = [{"role": "user", "content": messages}]
         else:
@@ -509,13 +531,21 @@ class ReactAgent(object):
         emitted_any = False
         user_context_token = set_current_agent_user_id(user_id)
         try:
-            for event in self._execute_messages_stream(input_dict, user_id):
+            for event in self._execute_messages_stream(
+                input_dict,
+                user_id,
+                user_runtime_context,
+            ):
                 emitted_any = True
                 yield event
         except Exception:
             if emitted_any:
                 raise
 
-            yield from self._execute_values_stream(input_dict, user_id)
+            yield from self._execute_values_stream(
+                input_dict,
+                user_id,
+                user_runtime_context,
+            )
         finally:
             reset_current_agent_user_id(user_context_token)

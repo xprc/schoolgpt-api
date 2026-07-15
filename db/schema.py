@@ -3,7 +3,7 @@ from collections.abc import Iterable
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
 
-from api.db.seeds import (
+from db.seeds import (
     seed_default_model_config,
     seed_default_paddle_ocr_config,
     seed_default_web_search_config,

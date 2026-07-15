@@ -1,11 +1,11 @@
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import PromptTemplate
 
-from api.services.model_config_service import get_model_config_service
+from model.config_service import get_model_config_service
 from model.factory import create_webchat_model
 from rag.source_context import add_rag_sources
 from rag.vector_store import get_vector_store_service
-from utils.prompt_loader import load_policy_rag_search_prompt
+from prompts.prompt_loader import load_policy_rag_search_prompt
 
 
 class PolicyRagSearchService(object):
