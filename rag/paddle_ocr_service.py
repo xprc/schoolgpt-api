@@ -1,6 +1,10 @@
 import json
 import mimetypes
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -8,19 +12,22 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-import requests
 from sqlalchemy import text
 
 from db.core import get_database_engine
 from db.defaults import (
+    PADDLE_OCR_JOB_URL,
     PADDLE_OCR_MODEL,
     PADDLE_OCR_PROVIDER,
     PADDLE_OCR_PROVIDER_LABEL,
 )
 from db.schema import initialize_paddle_ocr_configs_schema
 
-PADDLE_OCR_JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
 PADDLE_OCR_LOCAL_FILE_LIMIT = 50 * 1024 * 1024
+PADDLE_OCR_UPLOAD_TIMEOUT_SECONDS = 300
+PADDLE_OCR_REQUEST_TIMEOUT_SECONDS = 120
+PADDLE_OCR_DOWNLOAD_MAX_ATTEMPTS = 4
+PADDLE_OCR_DOWNLOAD_RETRY_DELAY_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -144,40 +151,146 @@ class PaddleOcrClient:
         model_name: str = PADDLE_OCR_MODEL,
         poll_interval_seconds: float = 5.0,
         max_wait_seconds: float = 1800.0,
-        session: requests.Session | None = None,
+        session: Any | None = None,
     ) -> None:
         self.api_key = api_key.strip()
         self.model_name = model_name
         self.poll_interval_seconds = poll_interval_seconds
         self.max_wait_seconds = max_wait_seconds
-        self.session = session or requests.Session()
+        if session is None:
+            self._urlopen = urllib.request.urlopen
+        elif callable(session):
+            self._urlopen = session
+        elif hasattr(session, "urlopen"):
+            self._urlopen = session.urlopen
+        else:
+            raise TypeError("session must be urlopen-compatible")
 
     @property
     def headers(self) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {self.api_key}",
-            "Accept-Encoding": "gzip, deflate, br",
         }
 
-    @staticmethod
-    def _response_payload(response: requests.Response, action: str) -> dict[str, Any]:
+    def _open_text(
+        self,
+        request: urllib.request.Request,
+        action: str,
+        timeout: int,
+    ) -> str:
         try:
-            payload = response.json()
-        except ValueError as exc:
+            with self._urlopen(request, timeout=timeout) as response:
+                return response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            text = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"PaddleOCR {action}失败（HTTP {exc.code}）：{text}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"PaddleOCR {action}网络请求失败：{exc.reason}") from exc
+        except TimeoutError as exc:
+            raise RuntimeError(f"PaddleOCR {action}网络请求超时：{exc}") from exc
+        except OSError as exc:
+            raise RuntimeError(f"PaddleOCR {action}网络请求失败：{exc}") from exc
+
+    def _send_json_request(
+        self,
+        request: urllib.request.Request,
+        action: str,
+        timeout: int,
+    ) -> dict[str, Any]:
+        text_value = self._open_text(request, action, timeout)
+        try:
+            payload = json.loads(text_value)
+        except json.JSONDecodeError as exc:
             raise RuntimeError(f"PaddleOCR {action}返回了无效 JSON") from exc
 
         if not isinstance(payload, dict):
             raise RuntimeError(f"PaddleOCR {action}返回格式不正确")
 
         code = payload.get("code")
-        if not response.ok or code not in (None, 0):
-            message = str(payload.get("msg") or payload.get("message") or response.reason)
+        if code not in (None, 0):
+            message = str(payload.get("msg") or payload.get("message") or "未知错误")
             data = payload.get("data")
             if isinstance(data, dict) and data.get("errorMsg"):
                 message = str(data["errorMsg"])
-            raise RuntimeError(f"PaddleOCR {action}失败（{code or response.status_code}）：{message}")
+            raise RuntimeError(f"PaddleOCR {action}失败（{code}）：{message}")
 
         return payload
+
+    def _get_json(self, url: str, action: str) -> dict[str, Any]:
+        request = urllib.request.Request(url, headers=self.headers, method="GET")
+        return self._send_json_request(
+            request,
+            action,
+            PADDLE_OCR_REQUEST_TIMEOUT_SECONDS,
+        )
+
+    def _download_text(self, url: str, action: str) -> str:
+        last_error: BaseException | None = None
+        for attempt in range(1, PADDLE_OCR_DOWNLOAD_MAX_ATTEMPTS + 1):
+            request = urllib.request.Request(url, method="GET")
+            try:
+                with self._urlopen(
+                    request,
+                    timeout=PADDLE_OCR_REQUEST_TIMEOUT_SECONDS,
+                ) as response:
+                    return response.read().decode("utf-8")
+            except urllib.error.HTTPError as exc:
+                text = exc.read().decode("utf-8", errors="replace")
+                raise RuntimeError(f"PaddleOCR {action}失败（HTTP {exc.code}）：{text}") from exc
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                last_error = exc
+                if attempt >= PADDLE_OCR_DOWNLOAD_MAX_ATTEMPTS:
+                    break
+                time.sleep(PADDLE_OCR_DOWNLOAD_RETRY_DELAY_SECONDS * attempt)
+
+        raise RuntimeError(f"PaddleOCR {action}网络请求失败：{last_error}")
+
+    def _post_multipart(
+        self,
+        url: str,
+        fields: Mapping[str, object],
+        file_field_name: str,
+        file_path: Path,
+    ) -> dict[str, Any]:
+        boundary = "----PythonOCRDemo" + uuid.uuid4().hex
+        body = bytearray()
+
+        for name, value in fields.items():
+            body.extend(f"--{boundary}\r\n".encode())
+            body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+            body.extend(str(value).encode("utf-8"))
+            body.extend(b"\r\n")
+
+        filename = file_path.name
+        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        file_bytes = file_path.read_bytes()
+
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(
+            (
+                f'Content-Disposition: form-data; name="{file_field_name}"; '
+                f'filename="{filename}"\r\n'
+            ).encode()
+        )
+        body.extend(f"Content-Type: {content_type}\r\n\r\n".encode())
+        body.extend(file_bytes)
+        body.extend(b"\r\n")
+        body.extend(f"--{boundary}--\r\n".encode())
+
+        request = urllib.request.Request(
+            url,
+            data=bytes(body),
+            method="POST",
+            headers={
+                **self.headers,
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+        )
+        return self._send_json_request(
+            request,
+            "任务提交",
+            PADDLE_OCR_UPLOAD_TIMEOUT_SECONDS,
+        )
 
     @staticmethod
     def parse_jsonl_pages(jsonl_text: str) -> list[str]:
@@ -217,67 +330,81 @@ class PaddleOcrClient:
             "useDocOrientationClassify": True,
             "useDocUnwarping": True,
             "useChartRecognition": True,
-            "showFormulaNumber": True,
             "prettifyMarkdown": True,
+            "showFormulaNumber": True,
             "visualize": False,
         }
-        mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
 
-        try:
-            with path.open("rb") as source_file:
-                response = self.session.post(
-                    PADDLE_OCR_JOB_URL,
-                    headers=self.headers,
-                    data={
-                        "model": self.model_name,
-                        "optionalPayload": json.dumps(optional_payload, ensure_ascii=False),
-                    },
-                    files={"file": (path.name, source_file, mime_type)},
-                    timeout=(15, 120),
+        payload = self._post_multipart(
+            PADDLE_OCR_JOB_URL,
+            fields={
+                "model": self.model_name,
+                "optionalPayload": json.dumps(optional_payload, ensure_ascii=False),
+            },
+            file_field_name="file",
+            file_path=path,
+        )
+        data = payload.get("data")
+        job_id = str(data.get("jobId") or "") if isinstance(data, dict) else ""
+        if not job_id:
+            raise RuntimeError("PaddleOCR 任务提交成功但未返回 jobId")
+
+        deadline = time.monotonic() + self.max_wait_seconds
+        while time.monotonic() < deadline:
+            quoted_job_id = urllib.parse.quote(job_id, safe="")
+            result_payload = self._get_json(
+                f"{PADDLE_OCR_JOB_URL}/{quoted_job_id}",
+                "任务查询",
+            )
+            result_data = result_payload.get("data")
+            if not isinstance(result_data, dict):
+                raise RuntimeError("PaddleOCR 任务查询未返回 data")
+
+            state = str(result_data.get("state") or "")
+            if state == "failed":
+                raise RuntimeError(
+                    f"PaddleOCR 识别失败：{result_data.get('errorMsg') or '未知错误'}"
                 )
-            payload = self._response_payload(response, "任务提交")
-            data = payload.get("data")
-            job_id = str(data.get("jobId") or "") if isinstance(data, dict) else ""
-            if not job_id:
-                raise RuntimeError("PaddleOCR 任务提交成功但未返回 jobId")
-
-            deadline = time.monotonic() + self.max_wait_seconds
-            while time.monotonic() < deadline:
-                result_response = self.session.get(
-                    f"{PADDLE_OCR_JOB_URL}/{job_id}",
-                    headers=self.headers,
-                    timeout=(15, 120),
+            if state == "done":
+                result_url = result_data.get("resultUrl")
+                json_url = (
+                    str(result_url.get("jsonUrl") or "")
+                    if isinstance(result_url, dict)
+                    else ""
                 )
-                result_payload = self._response_payload(result_response, "任务查询")
-                result_data = result_payload.get("data")
-                if not isinstance(result_data, dict):
-                    raise RuntimeError("PaddleOCR 任务查询未返回 data")
+                markdown_url = (
+                    str(result_url.get("markdownUrl") or "")
+                    if isinstance(result_url, dict)
+                    else ""
+                )
+                if not json_url and not markdown_url:
+                    raise RuntimeError("PaddleOCR 任务完成但未返回 resultUrl")
 
-                state = str(result_data.get("state") or "")
-                if state == "failed":
-                    raise RuntimeError(
-                        f"PaddleOCR 识别失败：{result_data.get('errorMsg') or '未知错误'}"
-                    )
-                if state == "done":
-                    result_url = result_data.get("resultUrl")
-                    json_url = (
-                        str(result_url.get("jsonUrl") or "")
-                        if isinstance(result_url, dict)
-                        else ""
-                    )
-                    if not json_url:
-                        raise RuntimeError("PaddleOCR 任务完成但未返回 jsonUrl")
+                download_errors: list[str] = []
+                if json_url:
+                    try:
+                        jsonl_text = self._download_text(json_url, "JSONL 结果下载")
+                        return job_id, self.parse_jsonl_pages(jsonl_text)
+                    except RuntimeError as exc:
+                        download_errors.append(str(exc))
 
-                    jsonl_response = self.session.get(json_url, timeout=(15, 120))
-                    jsonl_response.raise_for_status()
-                    return job_id, self.parse_jsonl_pages(jsonl_response.text)
+                if markdown_url:
+                    try:
+                        markdown_text = self._download_text(markdown_url, "Markdown 结果下载")
+                    except RuntimeError as exc:
+                        download_errors.append(str(exc))
+                    else:
+                        normalized_markdown = markdown_text.strip()
+                        if normalized_markdown:
+                            return job_id, [normalized_markdown]
+                        download_errors.append("PaddleOCR Markdown 结果为空")
 
-                if state not in {"pending", "running"}:
-                    raise RuntimeError(f"PaddleOCR 返回了未知任务状态：{state or '空'}")
+                raise RuntimeError("；".join(download_errors))
 
-                time.sleep(self.poll_interval_seconds)
-        except requests.RequestException as exc:
-            raise RuntimeError(f"PaddleOCR 网络请求失败：{exc}") from exc
+            if state not in {"pending", "running"}:
+                raise RuntimeError(f"PaddleOCR 返回了未知任务状态：{state or '空'}")
+
+            time.sleep(self.poll_interval_seconds)
 
         raise TimeoutError(f"PaddleOCR 任务等待超过 {int(self.max_wait_seconds)} 秒")
 

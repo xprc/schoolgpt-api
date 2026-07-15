@@ -5,7 +5,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -16,6 +16,7 @@ import pandas as pd
 import pdfplumber
 from docx import Document as DocxDocument
 from PIL import Image, ImageOps
+from pypdf import PdfReader, PdfWriter
 from sqlalchemy import text
 
 from api.core.settings import PROJECT_ROOT
@@ -56,6 +57,7 @@ RAG_FILE_INDEXABLE_STATUSES = (
 
 STRUCTURED_CONTENT_VERSION = 1
 TABLE_ROWS_PER_BLOCK = 24
+PDF_PAGE_OCR_CHARACTER_THRESHOLD = 40
 
 
 @dataclass(frozen=True)
@@ -82,6 +84,13 @@ class RagFileRecord:
 class PreparedRagFile:
     record: RagFileRecord
     should_process: bool
+
+
+@dataclass(frozen=True)
+class PdfPageExtraction:
+    page_number: int
+    blocks: list[dict[str, Any]]
+    needs_ocr: bool
 
 
 def _now_utc() -> datetime:
@@ -537,55 +546,156 @@ def _doc_to_structured_content(
     )
 
 
+def _block_text_character_count(blocks: Iterable[Mapping[str, Any]]) -> int:
+    return sum(
+        len(re.sub(r"\s+", "", str(block.get("text") or "")))
+        for block in blocks
+    )
+
+
+def _pdf_page_visual_object_count(page: Any) -> int:
+    return sum(
+        len(getattr(page, attribute_name, None) or [])
+        for attribute_name in ("images", "curves", "rects", "lines")
+    )
+
+
+def _extract_pdf_page_blocks(page: Any, page_number: int) -> list[dict[str, Any]]:
+    blocks = []
+    block_index = 1
+    text_value = (page.extract_text() or "").strip()
+    if text_value:
+        block = _make_block(page_number, block_index, "page_text", text_value)
+        if block:
+            blocks.append(block)
+            block_index += 1
+
+    for table in page.extract_tables() or []:
+        table_blocks = _make_table_blocks(page_number, block_index, table)
+        blocks.extend(table_blocks)
+        block_index += len(table_blocks)
+
+    return blocks
+
+
+def _pdf_page_needs_ocr(page: Any, blocks: list[dict[str, Any]]) -> bool:
+    extracted_character_count = _block_text_character_count(blocks)
+    if extracted_character_count >= PDF_PAGE_OCR_CHARACTER_THRESHOLD:
+        return False
+
+    visual_object_count = _pdf_page_visual_object_count(page)
+    if visual_object_count <= 0:
+        return False
+
+    has_text_layer = bool(getattr(page, "chars", None) or [])
+    has_raster_image = bool(getattr(page, "images", None) or [])
+    if extracted_character_count == 0:
+        return True
+
+    return has_raster_image or not has_text_layer
+
+
+def _extract_pdf_pages(path: Path) -> list[PdfPageExtraction]:
+    page_extractions = []
+    with pdfplumber.open(str(path)) as pdf:
+        for page_number, page in enumerate(pdf.pages, 1):
+            blocks = _extract_pdf_page_blocks(page, page_number)
+            page_extractions.append(
+                PdfPageExtraction(
+                    page_number=page_number,
+                    blocks=blocks,
+                    needs_ocr=_pdf_page_needs_ocr(page, blocks),
+                )
+            )
+
+    return page_extractions
+
+
+def _write_pdf_page_subset(
+    source_path: Path,
+    page_numbers: list[int],
+    output_path: Path,
+) -> None:
+    reader = PdfReader(str(source_path))
+    writer = PdfWriter()
+    for page_number in page_numbers:
+        writer.add_page(reader.pages[page_number - 1])
+
+    with output_path.open("wb") as output_file:
+        writer.write(output_file)
+
+
+def extract_paddle_ocr_pdf_pages(
+    path: Path,
+    page_numbers: list[int],
+) -> tuple[str, dict[int, str]]:
+    config = get_paddle_ocr_config_service().get_config()
+    client = PaddleOcrClient(config.api_key, model_name=config.model_name)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir) / "ocr-pages.pdf"
+        _write_pdf_page_subset(path, page_numbers, temp_path)
+        job_id, page_texts = client.extract_pages(temp_path)
+
+    return job_id, {
+        page_number: _clean_text(page_texts[index])
+        if index < len(page_texts)
+        else ""
+        for index, page_number in enumerate(page_numbers)
+    }
+
+
 def _pdf_to_structured_content(
     path: Path,
     original_name: str,
     extension: str,
     sha256: str,
+    ocr_status_callback: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
+    page_extractions = _extract_pdf_pages(path)
+    ocr_page_numbers = [
+        page_extraction.page_number
+        for page_extraction in page_extractions
+        if page_extraction.needs_ocr
+    ]
+    ocr_text_by_page: dict[int, str] = {}
+
+    if ocr_page_numbers:
+        if ocr_status_callback:
+            ocr_status_callback()
+        _, ocr_text_by_page = extract_paddle_ocr_pdf_pages(path, ocr_page_numbers)
+
     pages = []
-
-    with pdfplumber.open(str(path)) as pdf:
-        for page_index, page in enumerate(pdf.pages, 1):
-            blocks = []
-            block_index = 1
-            text_value = (page.extract_text() or "").strip()
-            if text_value:
-                block = _make_block(page_index, block_index, "page_text", text_value)
-                if block:
-                    blocks.append(block)
-                    block_index += 1
-
-            for table in page.extract_tables() or []:
-                table_blocks = _make_table_blocks(page_index, block_index, table)
-                blocks.extend(table_blocks)
-                block_index += len(table_blocks)
-
-            pages.append(
-                {
-                    "page_number": page_index,
-                    "blocks": blocks,
-                }
+    for page_extraction in page_extractions:
+        blocks = page_extraction.blocks
+        ocr_text = ocr_text_by_page.get(page_extraction.page_number)
+        if ocr_text:
+            block = _make_block(
+                page_extraction.page_number,
+                1,
+                "ocr_markdown",
+                ocr_text,
             )
+            blocks = [block] if block else []
 
-    return _new_structured_content(original_name, extension, sha256, pages)
+        pages.append(
+            {
+                "page_number": page_extraction.page_number,
+                "blocks": blocks,
+            }
+        )
+
+    content = _new_structured_content(original_name, extension, sha256, pages)
+    if ocr_page_numbers:
+        content["ocr"] = {
+            "page_numbers": ocr_page_numbers,
+        }
+
+    return content
 
 
-def _is_image_pdf(path: Path) -> bool:
-    """Return true for scanned/image PDFs that have no meaningful text layer."""
-    with pdfplumber.open(str(path)) as pdf:
-        if not pdf.pages:
-            return False
-
-        text_character_count = 0
-        image_page_count = 0
-        for page in pdf.pages:
-            text_character_count += len(re.sub(r"\s+", "", page.extract_text() or ""))
-            if page.images:
-                image_page_count += 1
-
-        average_text_characters = text_character_count / len(pdf.pages)
-        return image_page_count == len(pdf.pages) and average_text_characters < 40
+def _pdf_has_ocr_pages(path: Path) -> bool:
+    return any(page_extraction.needs_ocr for page_extraction in _extract_pdf_pages(path))
 
 
 def requires_paddle_ocr(path: Path, original_name: str) -> bool:
@@ -593,7 +703,7 @@ def requires_paddle_ocr(path: Path, original_name: str) -> bool:
     if extension in {".png", ".jpg", ".jpeg"}:
         return True
     if extension == ".pdf":
-        return _is_image_pdf(path)
+        return _pdf_has_ocr_pages(path)
     return False
 
 
@@ -644,7 +754,12 @@ def extract_paddle_ocr_content(
     )
 
 
-def extract_structured_content(path: Path, original_name: str, sha256: str) -> dict[str, Any]:
+def extract_structured_content(
+    path: Path,
+    original_name: str,
+    sha256: str,
+    ocr_status_callback: Callable[[], None] | None = None,
+) -> dict[str, Any]:
     extension = _extension(original_name)
 
     if extension == ".txt":
@@ -658,7 +773,13 @@ def extract_structured_content(path: Path, original_name: str, sha256: str) -> d
     elif extension == ".doc":
         content = _doc_to_structured_content(path, original_name, extension, sha256)
     elif extension == ".pdf":
-        content = _pdf_to_structured_content(path, original_name, extension, sha256)
+        content = _pdf_to_structured_content(
+            path,
+            original_name,
+            extension,
+            sha256,
+            ocr_status_callback=ocr_status_callback,
+        )
     else:
         raise ValueError(f"不支持的文件类型: {extension}")
 
@@ -984,14 +1105,24 @@ class RagFileService:
         preview_pdf_path = _resolve_project_path(record.preview_pdf_path)
 
         try:
-            use_ocr = requires_paddle_ocr(source_path, record.original_name)
-            if use_ocr:
+            ocr_status_marked = False
+
+            def mark_ocr_status_once() -> None:
+                nonlocal ocr_status_marked
+                if ocr_status_marked:
+                    return
+
                 self.update_file_status(
                     file_id,
                     RAG_FILE_STATUS_OCR,
                     error_message=None,
                     used_ocr=True,
                 )
+                ocr_status_marked = True
+
+            extension = _extension(record.original_name)
+            if extension in {".png", ".jpg", ".jpeg"}:
+                mark_ocr_status_once()
                 _, structured_content = extract_paddle_ocr_content(
                     source_path,
                     record.original_name,
@@ -1002,6 +1133,7 @@ class RagFileService:
                     source_path,
                     record.original_name,
                     record.sha256,
+                    ocr_status_callback=mark_ocr_status_once,
                 )
             self.update_file_status(file_id, RAG_FILE_STATUS_RENDERING)
             structured_content = generate_preview_pdf(
