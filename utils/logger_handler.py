@@ -40,12 +40,18 @@ class SensitiveDataFilter(logging.Filter):
     """日志过滤器：自动脱敏日志中的敏感信息"""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        # 对日志消息脱敏
-        if record.msg:
-            record.msg = mask_sensitive_data(record.msg)
-        # 对日志参数脱敏（如果有）
-        if record.args:
-            record.args = tuple(mask_sensitive_data(arg) for arg in record.args)
+        # 先完成 %-style 参数插值，再对完整消息脱敏。如果先修改日志模板，
+        # "key=%s" 可能被替换为 "key=******"，但对应参数仍然存在，
+        # logging 随后会因占位符与参数数量不一致而格式化失败。
+        try:
+            message = record.getMessage()
+        except Exception:
+            # 不让单条格式错误的日志影响业务线程，也不在兜底消息中
+            # 拼接未知参数，避免意外泄露敏感数据。
+            message = str(record.msg)
+
+        record.msg = mask_sensitive_data(message)
+        record.args = ()
         return True
 
 
