@@ -42,7 +42,7 @@ sentence-transformers==5.3.0
 pandas==2.3.3
 openpyxl==3.1.5
 xlrd==2.0.1
-pdfplumber==0.11.9
+pdfplumber==0.11.10
 pypdf==6.9.2
 Pillow==12.1.1
 python-docx==1.2.0
